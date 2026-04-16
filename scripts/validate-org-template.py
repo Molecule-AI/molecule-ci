@@ -33,6 +33,9 @@ if not org.get("workspaces") and not org.get("defaults"):
     errors.append("org.yaml must have at least 'workspaces' or 'defaults'")
 
 def validate_workspace(ws, path=""):
+    # !include tags resolve to strings at parse time; skip non-dicts
+    if not isinstance(ws, dict):
+        return []
     ws_errors = []
     name = ws.get("name", "<unnamed>")
     full = f"{path}/{name}" if path else name
@@ -56,6 +59,8 @@ if errors:
 def count_ws(nodes):
     c = 0
     for n in nodes:
+        if not isinstance(n, dict):
+            continue
         c += 1
         c += count_ws(n.get("children", []))
     return c
