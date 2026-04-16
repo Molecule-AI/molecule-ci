@@ -1,107 +1,27 @@
 name: Validate Workspace Template
-
 on:
   workflow_call:
-    inputs:
-      python-version:
-        type: string
-        default: "3.11"
-
 jobs:
   validate:
     name: Template validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+        with:
+          repository: Molecule-AI/molecule-ci
+          path: .molecule-ci
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Validate config.yaml exists
-        run: |
-          if [ ! -f config.yaml ]; then
-            echo "::error::config.yaml not found at repo root"
-            exit 1
-          fi
-
-      - name: Validate config.yaml schema
-        run: |
-          pip install pyyaml -q
-          python3 << 'PYEOF'
-          import yaml, sys
-
-          with open("config.yaml") as f:
-              config = yaml.safe_load(f)
-
-          errors = []
-
-          # Required fields
-          if not config.get("name"):
-              errors.append("Missing required field: name")
-          if not config.get("runtime"):
-              errors.append("Missing required field: runtime")
-
-          # Known runtimes
-          known = {"langgraph", "claude-code", "crewai", "autogen", "deepagents", "hermes", "gemini-cli", "openclaw"}
-          runtime = config.get("runtime", "")
-          if runtime and runtime not in known:
-              print(f"::warning::Runtime '{runtime}' is not in the known set ({', '.join(sorted(known))}). This is OK for custom runtimes.")
-
-          # Schema version
-          sv = config.get("template_schema_version")
-          if sv is None:
-              errors.append("Missing template_schema_version (add: template_schema_version: 1)")
-          elif sv != 1:
-              print(f"::warning::template_schema_version is {sv}, expected 1")
-
-          if errors:
-              for e in errors:
-                  print(f"::error::{e}")
-              sys.exit(1)
-
-          print(f"✓ config.yaml valid: {config['name']} (runtime: {config.get('runtime')})")
-          PYEOF
-
-      - name: Validate adapter exists
-        run: |
-          if [ -f adapter.py ]; then
-            echo "✓ adapter.py found"
-            # Check it imports from molecule_runtime
-            if grep -q "molecule_runtime\|from adapters" adapter.py; then
-              echo "✓ adapter.py imports runtime base"
-            else
-              echo "::warning::adapter.py doesn't import from molecule_runtime — may use legacy imports"
-            fi
-          else
-            echo "::notice::No adapter.py — this template uses config-only mode (inherits default adapter for its runtime)"
-          fi
-
-      - name: Validate Dockerfile (if present)
-        run: |
-          if [ -f Dockerfile ]; then
-            echo "✓ Dockerfile found"
-            # Must install molecule-ai-workspace-runtime
-            if grep -q "molecule-ai-workspace-runtime" Dockerfile requirements.txt 2>/dev/null; then
-              echo "✓ Depends on molecule-ai-workspace-runtime"
-            else
-              echo "::warning::Dockerfile/requirements.txt doesn't reference molecule-ai-workspace-runtime"
-            fi
-            # Must set ADAPTER_MODULE or equivalent
-            if grep -q "ADAPTER_MODULE" Dockerfile; then
-              echo "✓ ADAPTER_MODULE env set"
-            fi
-          fi
-
+          python-version: "3.11"
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci/scripts/validate-workspace-template.py
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
-        run: |
-          docker build -t template-test . --no-cache 2>&1 | tail -5
-          echo "✓ Docker build succeeded"
-
+        run: docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "✓ Docker build succeeded"
       - name: Check for secrets
         run: |
-          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null; then
+          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v .molecule-ci; then
             echo "::error::Potential secret found in committed files"
             exit 1
           fi

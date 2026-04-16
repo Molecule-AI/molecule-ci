@@ -1,105 +1,25 @@
 name: Validate Plugin
-
 on:
   workflow_call:
-    inputs:
-      python-version:
-        type: string
-        default: "3.11"
-
 jobs:
   validate:
     name: Plugin validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+        with:
+          repository: Molecule-AI/molecule-ci
+          path: .molecule-ci
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Validate plugin.yaml exists
+          python-version: "3.11"
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci/scripts/validate-plugin.py
+      - name: Check for secrets
         run: |
-          if [ ! -f plugin.yaml ]; then
-            echo "::error::plugin.yaml not found at repo root"
-            exit 1
-          fi
-
-      - name: Validate plugin.yaml schema
-        run: |
-          pip install pyyaml -q
-          python3 << 'PYEOF'
-          import yaml, sys
-
-          with open("plugin.yaml") as f:
-              plugin = yaml.safe_load(f)
-
-          errors = []
-
-          # Required fields
-          for field in ["name", "version", "description"]:
-              if not plugin.get(field):
-                  errors.append(f"Missing required field: {field}")
-
-          # Version format
-          v = plugin.get("version", "")
-          if v and not all(c in "0123456789." for c in str(v)):
-              errors.append(f"Invalid version format: {v} (expected semver-like)")
-
-          # Runtimes should be a list if present
-          runtimes = plugin.get("runtimes")
-          if runtimes is not None and not isinstance(runtimes, list):
-              errors.append(f"runtimes must be a list, got {type(runtimes).__name__}")
-
-          if errors:
-              for e in errors:
-                  print(f"::error::{e}")
-              sys.exit(1)
-
-          print(f"✓ plugin.yaml valid: {plugin['name']} v{plugin['version']}")
-          if runtimes:
-              print(f"  Runtimes: {', '.join(runtimes)}")
-          PYEOF
-
-      - name: Validate plugin has content
-        run: |
-          # Must have at least one of: SKILL.md, hooks/, skills/, rules/
-          found=0
-          for path in SKILL.md hooks skills rules; do
-            if [ -e "$path" ]; then
-              echo "✓ Found: $path"
-              found=$((found + 1))
-            fi
-          done
-          if [ "$found" -eq 0 ]; then
-            echo "::error::Plugin must contain at least one of: SKILL.md, hooks/, skills/, rules/"
-            exit 1
-          fi
-          echo "✓ Plugin has $found content entries"
-
-      - name: Validate SKILL.md format (if present)
-        run: |
-          if [ -f SKILL.md ]; then
-            # Must start with # heading
-            first_line=$(head -1 SKILL.md)
-            if [[ ! "$first_line" =~ ^#\  ]]; then
-              echo "::warning::SKILL.md should start with a # heading"
-            fi
-            echo "✓ SKILL.md present ($(wc -l < SKILL.md) lines)"
-          fi
-
-      - name: Check for common mistakes
-        run: |
-          # No secrets in committed files
-          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null; then
+          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v .molecule-ci; then
             echo "::error::Potential secret found in committed files"
             exit 1
           fi
           echo "✓ No secrets detected"
-
-          # No node_modules or __pycache__ committed
-          if [ -d node_modules ] || [ -d __pycache__ ]; then
-            echo "::error::node_modules or __pycache__ should not be committed"
-            exit 1
-          fi
-          echo "✓ No build artifacts committed"
