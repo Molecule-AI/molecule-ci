@@ -2,6 +2,21 @@
 """Validate a Molecule AI org template repo."""
 import os, sys, yaml
 
+# Support !include and other custom YAML tags used by org templates.
+# These resolve at platform load time, not at validation time — we just
+# need to parse past them without crashing.
+class PermissiveLoader(yaml.SafeLoader):
+    pass
+
+def _generic_constructor(loader, tag_suffix, node):
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    return loader.construct_scalar(node)
+
+PermissiveLoader.add_multi_constructor("!", _generic_constructor)
+
 errors = []
 
 if not os.path.isfile("org.yaml"):
@@ -9,7 +24,7 @@ if not os.path.isfile("org.yaml"):
     sys.exit(1)
 
 with open("org.yaml") as f:
-    org = yaml.safe_load(f)
+    org = yaml.load(f, Loader=PermissiveLoader)
 
 if not org.get("name"):
     errors.append("Missing required field: name")
