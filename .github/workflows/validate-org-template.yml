@@ -1,0 +1,137 @@
+name: Validate Org Template
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        type: string
+        default: "3.11"
+
+jobs:
+  validate:
+    name: Org template validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Validate org.yaml exists
+        run: |
+          if [ ! -f org.yaml ]; then
+            echo "::error::org.yaml not found at repo root"
+            exit 1
+          fi
+
+      - name: Validate org.yaml schema
+        run: |
+          pip install pyyaml -q
+          python3 << 'PYEOF'
+          import yaml, sys
+
+          with open("org.yaml") as f:
+              org = yaml.safe_load(f)
+
+          errors = []
+
+          # Required top-level fields
+          if not org.get("name"):
+              errors.append("Missing required field: name")
+
+          # Must have workspaces or defaults
+          if not org.get("workspaces") and not org.get("defaults"):
+              errors.append("org.yaml must have at least 'workspaces' or 'defaults'")
+
+          # Schema version
+          # Check in defaults or top-level
+          sv = org.get("template_schema_version")
+          if sv is None and org.get("defaults"):
+              sv = org["defaults"].get("template_schema_version")
+          if sv is None:
+              print("::warning::No template_schema_version found (recommended: add template_schema_version: 1)")
+
+          # Validate workspace structure
+          def validate_workspace(ws, path=""):
+              ws_errors = []
+              name = ws.get("name", "<unnamed>")
+              full = f"{path}/{name}" if path else name
+
+              if not ws.get("name"):
+                  ws_errors.append(f"Workspace at {full}: missing 'name'")
+
+              # Validate plugins are strings
+              plugins = ws.get("plugins", [])
+              if plugins and not isinstance(plugins, list):
+                  ws_errors.append(f"{full}: 'plugins' must be a list")
+
+              # Validate children recursively
+              for child in ws.get("children", []):
+                  ws_errors.extend(validate_workspace(child, full))
+
+              return ws_errors
+
+          for ws in org.get("workspaces", []):
+              errors.extend(validate_workspace(ws))
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+
+          # Count workspaces
+          def count_ws(nodes):
+              c = 0
+              for n in nodes:
+                  c += 1
+                  c += count_ws(n.get("children", []))
+              return c
+
+          total = count_ws(org.get("workspaces", []))
+          print(f"✓ org.yaml valid: {org['name']} ({total} workspaces)")
+          PYEOF
+
+      - name: Validate per-role directories
+        run: |
+          pip install pyyaml -q
+          python3 << 'PYEOF'
+          import yaml, os
+
+          with open("org.yaml") as f:
+              org = yaml.safe_load(f)
+
+          warnings = 0
+          def check_files_dir(ws, path=""):
+              nonlocal warnings
+              name = ws.get("name", "")
+              files_dir = ws.get("files_dir", "")
+              if files_dir:
+                  if not os.path.isdir(files_dir):
+                      print(f"::warning::files_dir '{files_dir}' for {name} does not exist as a directory")
+                      warnings += 1
+                  elif not os.path.isfile(os.path.join(files_dir, "system-prompt.md")):
+                      print(f"::warning::{files_dir}/system-prompt.md missing for {name}")
+                      warnings += 1
+                  else:
+                      print(f"✓ {files_dir}/system-prompt.md exists for {name}")
+              for child in ws.get("children", []):
+                  check_files_dir(child, f"{path}/{name}")
+
+          for ws in org.get("workspaces", []):
+              check_files_dir(ws)
+
+          if warnings:
+              print(f"\n{warnings} warning(s) — some files_dir references may be missing")
+          else:
+              print("✓ All files_dir references valid")
+          PYEOF
+
+      - name: Check for secrets
+        run: |
+          # Skip .env files (they're supposed to have placeholders)
+          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v ".env"; then
+            echo "::error::Potential secret found in committed files"
+            exit 1
+          fi
+          echo "✓ No secrets detected"
