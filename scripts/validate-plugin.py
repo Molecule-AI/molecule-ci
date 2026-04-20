@@ -33,6 +33,13 @@ found = [p for p in content_paths if os.path.exists(p)]
 if not found:
     errors.append("Plugin must contain at least one of: SKILL.md, hooks/, skills/, rules/")
 
+# 6. SKILL.md formatting check
+if os.path.isfile("SKILL.md"):
+    with open("SKILL.md") as f:
+        first_line = f.readline().strip()
+    if first_line and not first_line.startswith("#"):
+        print("::warning::SKILL.md should start with a markdown heading (e.g., # Plugin Name)")
+
 if errors:
     for e in errors:
         print(f"::error::{e}")
