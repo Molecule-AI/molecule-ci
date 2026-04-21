@@ -9,12 +9,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        repository: Molecule-AI/molecule-ci
+        path: molecule-ci
+        ref: ${{ github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: .molecule-ci/scripts/requirements.txt
+          cache-dependency-path: molecule-ci/.molecule-ci/scripts/requirements.txt
       - run: pip install pyyaml -q
-      - run: python3 .molecule-ci/scripts/validate-org-template.py
+      - run: python3 molecule-ci/.molecule-ci/scripts/validate-org-template.py
       - name: Check for secrets
-        run: python3 scripts/check-secrets.py
+        run: python3 molecule-ci/.molecule-ci/scripts/check-secrets.py
