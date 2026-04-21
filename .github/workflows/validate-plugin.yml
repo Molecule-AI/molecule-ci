@@ -17,9 +17,4 @@ jobs:
       - run: pip install pyyaml -q
       - run: python3 .molecule-ci/scripts/validate-plugin.py
       - name: Check for secrets
-        run: |
-          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v .molecule-ci; then
-            echo "::error::Potential secret found in committed files"
-            exit 1
-          fi
-          echo "✓ No secrets detected"
+        run: python3 scripts/check-secrets.py
