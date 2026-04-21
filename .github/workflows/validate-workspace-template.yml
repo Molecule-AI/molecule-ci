@@ -20,9 +20,4 @@ jobs:
         if: hashFiles('Dockerfile') != ''
         run: docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "✓ Docker build succeeded"
       - name: Check for secrets
-        run: |
-          if grep -rE "(sk-ant-|sk_test_|ghp_|AKIA[A-Z0-9])" --include="*.yaml" --include="*.yml" --include="*.md" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v .molecule-ci; then
-            echo "::error::Potential secret found in committed files"
-            exit 1
-          fi
-          echo "✓ No secrets detected"
+        run: python3 scripts/check-secrets.py
