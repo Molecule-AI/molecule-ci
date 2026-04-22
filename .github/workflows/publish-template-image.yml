@@ -20,13 +20,14 @@ name: Publish Workspace Template Image
 #       uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
 #       secrets: inherit
 #
-# Why one workflow instead of 8 copies:
-# - Stamp-out consistency: self-hosted macOS runner, Keychain-avoiding
-#   docker config, QEMU cross-build all live in one place.
-# - One PR to change the pattern (e.g. add semver tagging later) instead
-#   of 8 identical PRs across every plugin repo.
-# - Mirrors the existing validate-workspace-template.yml pattern already
-#   in this repo.
+# Runner choice (2026-04-22): ubuntu-latest
+#   - All caller repos are PUBLIC → GHA-hosted minutes are free.
+#   - Targets are linux/amd64 natively; Ubuntu runners skip QEMU that
+#     our arm64 Mac mini had to emulate through, so builds go ~2-3x
+#     faster on top of having no queue wait when the Mac mini is busy.
+#   - No macOS Keychain gymnastics — standard docker/login-action works.
+#   The self-hosted Mac mini remains in service for private repo
+#   workflows (see memory: feedback_selfhosted_runner).
 
 on:
   workflow_call:
@@ -50,10 +51,7 @@ on:
 jobs:
   publish:
     name: Build & push template image
-    # Self-hosted mac mini runner — memory[feedback_selfhosted_runner]:
-    # publish workflows must stay on self-hosted to avoid GHA rate limits.
-    # Do NOT change to ubuntu-latest.
-    runs-on: [self-hosted, macos, arm64]
+    runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.tags.outputs.image }}
       sha: ${{ steps.tags.outputs.sha }}
@@ -92,33 +90,15 @@ jobs:
           echo "sha=${SHA}"         >> "$GITHUB_OUTPUT"
           echo "::notice::Publishing runtime='${RUNTIME}' → ${IMAGE}:latest + :sha-${SHA}"
 
-      - name: Configure GHCR auth (write auths map; do NOT call docker login)
-        # Mirrors publish-canvas-image.yml. `docker login` on the Mac mini
-        # writes to osxkeychain unconditionally, which fails under the
-        # locked launchd keychain. Writing the auths map directly works
-        # for docker/build-push-action without needing login.
-        shell: bash
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eu
-          mkdir -p "${RUNNER_TEMP}/docker-config"
-          AUTH=$(printf '%s:%s' "${GHCR_USER}" "${GHCR_TOKEN}" | base64)
-          umask 077
-          cat > "${RUNNER_TEMP}/docker-config/config.json" <<JSON
-          { "auths": { "ghcr.io": { "auth": "${AUTH}" } } }
-          JSON
-          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "${GITHUB_ENV}"
-
-      - name: Set up QEMU
-        # Apple-silicon runner producing linux/amd64 for x86 tenant hosts.
-        uses: docker/setup-qemu-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          platforms: linux/amd64
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Build & push template image to GHCR
         uses: docker/build-push-action@v6
@@ -138,19 +118,17 @@ jobs:
             org.opencontainers.image.description=Molecule AI workspace template — ${{ steps.tags.outputs.runtime }} runtime
 
       - name: Smoke test the pushed image
-        # Pull the tag we just pushed and verify the entrypoint at least
-        # starts. Catches "image pushed but binary missing" regressions
-        # without needing a full end-to-end provision test.
+        # Pull the tag we just pushed and verify the entrypoint is set.
+        # Catches "image pushed but binary missing" regressions without a
+        # full end-to-end provision test. We don't `docker run` — most
+        # templates need platform env (WORKSPACE_ID, PLATFORM_URL, etc.)
+        # to actually boot, so inspection is the right layer here.
         shell: bash
         env:
           IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
         run: |
           set -eu
           docker pull "${IMAGE}"
-          # Just inspect — most templates need platform env (WORKSPACE_ID,
-          # PLATFORM_URL, etc.) to actually boot, so we don't `docker run`
-          # here. Verifying the image is pullable + has an entrypoint is
-          # enough for a post-push smoke check.
           docker inspect "${IMAGE}" --format '{{.Config.Entrypoint}} {{.Config.Cmd}}' \
             | tee /dev/stderr \
             | grep -qE '.' || { echo "::error::Image has empty entrypoint+cmd"; exit 1; }
