@@ -97,19 +97,20 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "github-actions[bot]"
 
-          git fetch origin main:main staging:staging 2>&1
+          # staging is the checked-out branch (workflow fires on push to
+          # staging). Can't fetch into it. Fetch main into a local main.
+          git fetch origin main
+          git checkout -B main origin/main
 
-          # Check if main is already at or ahead of staging — nothing to do.
-          if git merge-base --is-ancestor staging main 2>/dev/null; then
+          # Check if main is already at or ahead of origin/staging.
+          if git merge-base --is-ancestor origin/staging main 2>/dev/null; then
             echo "main already contains staging; nothing to promote."
             exit 0
           fi
 
-          git checkout main
-
           # --ff-only refuses if main has independent commits not on
           # staging (divergence — hotfix direct to main). Human resolves.
-          if ! git merge --ff-only staging 2>&1; then
+          if ! git merge --ff-only origin/staging 2>&1; then
             echo "::warning::main has diverged from staging — refusing fast-forward. Resolve manually (likely a direct-to-main commit exists that staging doesn't have)."
             exit 0
           fi
