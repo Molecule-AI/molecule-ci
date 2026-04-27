@@ -99,16 +99,45 @@ jobs:
         # package. This bit claude-code (5 imports), langgraph,
         # deepagents, and gemini-cli on 2026-04-27 — each one a
         # separate workspace-stuck-in-provisioning incident.
-        # The set of names mirrors workspace/*.py basenames at the time
-        # this lint was added; if a new runtime module ships, the
-        # build will fail loud with a clear message instead of
-        # silently shipping broken templates. Fail-fast: this runs
-        # before docker login + buildx setup so a bad PR returns red
-        # in seconds, not minutes.
+        #
+        # Source of truth: molecule_runtime/_runtime_modules.json
+        # inside the published wheel (emitted by
+        # scripts/build_runtime_package.py). Pulling the manifest
+        # from PyPI's latest wheel ensures the lint never drifts from
+        # the rewriter's actual closed list. If the manifest can't be
+        # fetched (older wheel, PyPI down, etc.), falls back to the
+        # inline list — known to be correct as of 2026-04-27 — so
+        # the lint never silently passes on a fetch failure.
+        #
+        # Fail-fast: this runs before docker login + buildx setup so
+        # a bad PR returns red in seconds, not minutes.
         shell: bash
         run: |
           set -eu
-          RUNTIME_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|shared_runtime'
+
+          # Fallback list — used only when the manifest fetch fails.
+          # Mirrors scripts/build_runtime_package.py:TOP_LEVEL_MODULES
+          # at the time this comment was written.
+          FALLBACK_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|shared_runtime'
+
+          RUNTIME_MODULES=""
+          mkdir -p /tmp/runtime-wheel
+          if pip download --quiet molecule-ai-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
+            WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
+            if [ -n "$WHEEL" ]; then
+              # Pull both top_level + subpackage names; both can be bare-imported.
+              RUNTIME_MODULES=$(unzip -p "$WHEEL" molecule_runtime/_runtime_modules.json 2>/dev/null \
+                | python3 -c "import sys,json; m=json.load(sys.stdin); print('|'.join(sorted(set(m['top_level_modules']) | set(m['subpackages']))))" 2>/dev/null || echo "")
+            fi
+          fi
+
+          if [ -n "$RUNTIME_MODULES" ]; then
+            echo "::notice::lint module list pulled from molecule-ai-workspace-runtime wheel manifest"
+          else
+            RUNTIME_MODULES="$FALLBACK_MODULES"
+            echo "::warning::could not read _runtime_modules.json from PyPI wheel — using inline fallback list"
+          fi
+
           # Match `from <module> import` at start of line OR after any whitespace
           # (function-scope imports inside if/try blocks count too).
           if HITS=$(grep -nE "^\s*from (${RUNTIME_MODULES}) import" *.py 2>/dev/null); then
