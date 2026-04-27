@@ -90,6 +90,35 @@ jobs:
           echo "sha=${SHA}"         >> "$GITHUB_OUTPUT"
           echo "::notice::Publishing runtime='${RUNTIME}' → ${IMAGE}:latest + :sha-${SHA}"
 
+      - name: Lint — no bare imports of runtime modules
+        # Templates that bare-import a workspace/ runtime module
+        # (e.g. `from plugins import load_plugins` instead of
+        # `from molecule_runtime.plugins import load_plugins`) work in
+        # the monorepo's bundled-runtime layout but explode at startup
+        # with `ModuleNotFoundError` once the runtime is installed as a
+        # package. This bit claude-code (5 imports), langgraph,
+        # deepagents, and gemini-cli on 2026-04-27 — each one a
+        # separate workspace-stuck-in-provisioning incident.
+        # The set of names mirrors workspace/*.py basenames at the time
+        # this lint was added; if a new runtime module ships, the
+        # build will fail loud with a clear message instead of
+        # silently shipping broken templates. Fail-fast: this runs
+        # before docker login + buildx setup so a bad PR returns red
+        # in seconds, not minutes.
+        shell: bash
+        run: |
+          set -eu
+          RUNTIME_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|shared_runtime'
+          # Match `from <module> import` at start of line OR after any whitespace
+          # (function-scope imports inside if/try blocks count too).
+          if HITS=$(grep -nE "^\s*from (${RUNTIME_MODULES}) import" *.py 2>/dev/null); then
+            echo "::error::Bare imports of runtime modules found — must use \`from molecule_runtime.<module> import\`"
+            echo "$HITS" | sed 's/^/  /'
+            echo "::error::Fix: prefix each match with 'molecule_runtime.' (e.g. 'from plugins' → 'from molecule_runtime.plugins')."
+            exit 1
+          fi
+          echo "::notice::✓ no bare imports of runtime modules in template *.py files"
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -124,25 +153,41 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — ${{ steps.tags.outputs.runtime }} runtime
 
-      - name: Smoke test — boot image and import adapter.py
-        # The real boot test. Runs `python -c "import adapter"` inside the
-        # image, which exercises:
-        #   - adapter.py exists at /app/
-        #   - all `from molecule_runtime...` imports resolve against the
-        #     pip-installed runtime version (catches the version skew
-        #     class of bug — symbol added to runtime but PyPI not yet
-        #     republished, or template pinned to old runtime, etc.)
-        #   - no syntax errors in adapter.py
-        # We bypass the gosu/agent entrypoint with --entrypoint sh because
-        # we don't need workspace permissions for an import check.
+      - name: Smoke test — boot image and import every /app/*.py
+        # The real boot test. Imports every Python module at /app/ inside
+        # the image, which exercises:
+        #   - adapter.py exists, no syntax errors, all module-level
+        #     imports resolve against the pip-installed runtime version
+        #     (catches version skew — symbol added to runtime but PyPI
+        #     not yet republished, etc.)
+        #   - executor.py / cli_executor.py / claude_sdk_executor.py /
+        #     etc. — sibling modules adapter.py imports lazily inside
+        #     create_executor(). Plain `import adapter` doesn't catch
+        #     bugs there because they're behind `def create_executor`.
+        #     This bit hermes (a2a-sdk migration) and langgraph
+        #     (LangGraphA2AExecutor bare import) on 2026-04-27.
+        #   - cross-cutting: any bare `from <runtime_module>` (the lint
+        #     above catches these statically; this catches them at
+        #     resolution time too, plus any imports of third-party
+        #     packages that the lint can't reason about).
+        # We bypass the gosu/agent entrypoint with --entrypoint sh
+        # because import smoke doesn't need workspace permissions.
         shell: bash
         env:
           IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
         run: |
           set -eu
-          docker run --rm --entrypoint sh "${IMAGE}" -c \
-            "cd /app && python3 -c 'import adapter; print(\"adapter imports cleanly:\", adapter.__name__)'"
-          echo "::notice::✓ ${IMAGE} adapter.py imports cleanly against installed runtime"
+          docker run --rm --entrypoint sh "${IMAGE}" -c '
+            set -e
+            cd /app
+            for f in *.py; do
+              [ "$f" = "__init__.py" ] && continue
+              mod="${f%.py}"
+              python3 -c "import $mod" || { echo "::error::failed to import $mod"; exit 1; }
+              echo "  ✓ $mod"
+            done
+          '
+          echo "::notice::✓ ${IMAGE} all /app/*.py modules import cleanly against installed runtime"
 
       - name: Push image to GHCR (post-smoke)
         # Now that the smoke test passed, push both tags. build-push-action
