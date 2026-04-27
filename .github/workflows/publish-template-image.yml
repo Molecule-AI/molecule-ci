@@ -100,7 +100,54 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build & push template image to GHCR
+      - name: Build template image (load for smoke test, do not push yet)
+        # Build into the runner's local docker first so the smoke test can
+        # actually boot the image. We push :latest + :sha-* only AFTER the
+        # smoke test passes — this is the gate that prevents broken images
+        # from poisoning :latest. Background: 2026-04-27 outage where the
+        # template's adapter.py imported a symbol (RuntimeCapabilities)
+        # that the published runtime didn't yet export. The old smoke
+        # test only inspected the entrypoint string, so the broken image
+        # shipped to GHCR and every workspace provision hung.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI workspace template — ${{ steps.tags.outputs.runtime }} runtime
+
+      - name: Smoke test — boot image and import adapter.py
+        # The real boot test. Runs `python -c "import adapter"` inside the
+        # image, which exercises:
+        #   - adapter.py exists at /app/
+        #   - all `from molecule_runtime...` imports resolve against the
+        #     pip-installed runtime version (catches the version skew
+        #     class of bug — symbol added to runtime but PyPI not yet
+        #     republished, or template pinned to old runtime, etc.)
+        #   - no syntax errors in adapter.py
+        # We bypass the gosu/agent entrypoint with --entrypoint sh because
+        # we don't need workspace permissions for an import check.
+        shell: bash
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
+        run: |
+          set -eu
+          docker run --rm --entrypoint sh "${IMAGE}" -c \
+            "cd /app && python3 -c 'import adapter; print(\"adapter imports cleanly:\", adapter.__name__)'"
+          echo "::notice::✓ ${IMAGE} adapter.py imports cleanly against installed runtime"
+
+      - name: Push image to GHCR (post-smoke)
+        # Now that the smoke test passed, push both tags. build-push-action
+        # reuses the cached build from the load step above, so this is fast
+        # — it's effectively a layer push, not a rebuild.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -116,20 +163,3 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — ${{ steps.tags.outputs.runtime }} runtime
-
-      - name: Smoke test the pushed image
-        # Pull the tag we just pushed and verify the entrypoint is set.
-        # Catches "image pushed but binary missing" regressions without a
-        # full end-to-end provision test. We don't `docker run` — most
-        # templates need platform env (WORKSPACE_ID, PLATFORM_URL, etc.)
-        # to actually boot, so inspection is the right layer here.
-        shell: bash
-        env:
-          IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
-        run: |
-          set -eu
-          docker pull "${IMAGE}"
-          docker inspect "${IMAGE}" --format '{{.Config.Entrypoint}} {{.Config.Cmd}}' \
-            | tee /dev/stderr \
-            | grep -qE '.' || { echo "::error::Image has empty entrypoint+cmd"; exit 1; }
-          echo "::notice::✓ ${IMAGE} pulled and entrypoint verified"
