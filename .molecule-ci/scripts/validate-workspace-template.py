@@ -172,6 +172,7 @@ def check_requirements() -> None:
 # ───────────────────────────────────────────────────────────── adapter.py
 
 def check_adapter() -> None:
+    """Static-text adapter checks. Fast — no imports."""
     if not os.path.isfile("adapter.py"):
         warn("no adapter.py — runtime will use the default langgraph executor from the wheel")
         return
@@ -186,11 +187,112 @@ def check_adapter() -> None:
         )
 
 
+def check_adapter_runtime_load() -> None:
+    """Strong adapter contract: import adapter.py the same way the runtime
+    does at workspace boot, and assert at least one class in it inherits
+    from molecule_runtime.adapters.base.BaseAdapter.
+
+    The Docker build smoke test in validate-workspace-template.yml builds
+    the image but doesn't RUN it — adapter.py is only imported at
+    container startup. So a template with a syntactically-valid Dockerfile
+    + a broken adapter.py (wrong base class, ImportError on a missing
+    framework dep, typo) builds clean and fails on first user prompt.
+    This check exercises the same class-resolution path the runtime uses,
+    so a passing validator means a passing workspace boot for the
+    adapter-load step.
+
+    Skip conditions:
+      - No adapter.py exists. Templates without one inherit the default
+        langgraph executor from the wheel (intentional, not drift).
+      - molecule-ai-workspace-runtime not importable in the validator
+        environment. That's a CI-config bug — the workflow that runs
+        this validator must `pip install molecule-ai-workspace-runtime`
+        first. Warn loudly so the misconfiguration surfaces, but don't
+        hard-fail (we'd be saying "your adapter is broken" when the
+        actual cause is missing infra). The `pip install -r
+        requirements.txt` step in validate-workspace-template.yml
+        normally satisfies this transitively.
+
+    Hard-error conditions:
+      - adapter.py raises any exception during import. The same
+        exception would crash workspace boot.
+      - No class in the module inherits from BaseAdapter. The runtime's
+        adapter-discovery would silently fall through to the default
+        executor, ignoring this file — exactly the kind of human-error
+        mode this contract is supposed to eliminate.
+    """
+    if not os.path.isfile("adapter.py"):
+        return  # check_adapter() already warned; don't double-warn
+
+    try:
+        from molecule_runtime.adapters.base import BaseAdapter  # noqa: PLC0415
+    except ImportError:
+        warn(
+            "adapter.py: skipping runtime-load check — "
+            "`molecule-ai-workspace-runtime` not installed in the validator "
+            "environment. The CI workflow that invokes this script must "
+            "`pip install molecule-ai-workspace-runtime` (or `pip install "
+            "-r requirements.txt`) first; otherwise this critical check is "
+            "silently bypassed."
+        )
+        return
+
+    # Load adapter.py as a module under a unique name so it doesn't
+    # collide with any installed `adapter` package or with a previous
+    # invocation in the same Python process.
+    import importlib.util  # noqa: PLC0415
+    import sys             # noqa: PLC0415
+
+    module_name = "_template_adapter_under_validation"
+    spec = importlib.util.spec_from_file_location(module_name, "adapter.py")
+    if spec is None or spec.loader is None:
+        err("adapter.py: cannot construct an import spec — file may be unreadable")
+        return
+
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod  # required so dataclass / pydantic refs resolve
+
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        err(
+            f"adapter.py: failed to import — `{type(e).__name__}: {e}`. "
+            f"This is the same failure mode that crashes workspace boot at "
+            f"runtime; the cure is to fix the adapter, not skip this check. "
+            f"If the import fails because a transitive dep isn't installed in "
+            f"this CI env, add it to the template's requirements.txt — that's "
+            f"what the workspace container does, and the validator job "
+            f"installs requirements.txt before running this check."
+        )
+        sys.modules.pop(module_name, None)
+        return
+
+    adapter_classes = [
+        obj
+        for name, obj in vars(mod).items()
+        if isinstance(obj, type)
+        and obj is not BaseAdapter
+        and issubclass(obj, BaseAdapter)
+    ]
+    sys.modules.pop(module_name, None)
+
+    if not adapter_classes:
+        err(
+            "adapter.py: no class inheriting from "
+            "`molecule_runtime.adapters.base.BaseAdapter` found. "
+            "The runtime resolves the adapter via class discovery — "
+            "without a BaseAdapter subclass, workspace boot falls "
+            "through to the default langgraph executor and ignores "
+            "this file silently. If that's intentional, delete adapter.py."
+        )
+
+
 def main() -> None:
     check_dockerfile()
     check_config_yaml()
     check_requirements()
     check_adapter()
+    check_adapter_runtime_load()
 
     for w in WARNINGS:
         print(f"::warning::{w}")

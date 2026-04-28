@@ -273,3 +273,146 @@ def test_modern_molecule_runtime_import_does_not_warn(validator, tmp_path, monke
     validator.check_adapter()
     legacy_warnings = [w for w in validator.WARNINGS if "molecule_ai" in w]
     assert legacy_warnings == [], legacy_warnings
+
+
+# ──────────────────── adapter.py runtime-load (strong contract)
+#
+# These tests pin the contract that adapter.py must be importable AND
+# define at least one BaseAdapter subclass — the same path the runtime
+# uses at workspace boot. Skipped when molecule-ai-workspace-runtime
+# isn't installed in the test environment (the validator's CI workflow
+# guarantees it via `pip install -r requirements.txt` before invoking
+# the validator; local pytest can run with or without it).
+
+def _has_runtime_installed() -> bool:
+    """True if molecule-ai-workspace-runtime is importable. Used to skip
+    the runtime-load tests when running pytest locally without the
+    runtime in the venv."""
+    try:
+        import molecule_runtime.adapters.base  # noqa: F401, PLC0415
+        return True
+    except ImportError:
+        return False
+
+
+_RUNTIME_AVAILABLE = _has_runtime_installed()
+_skip_no_runtime = pytest.mark.skipif(
+    not _RUNTIME_AVAILABLE,
+    reason="molecule-ai-workspace-runtime not installed in test env",
+)
+
+
+def test_no_adapter_skips_runtime_load_silently(validator, tmp_path, monkeypatch):
+    """No adapter.py = use default langgraph executor from the wheel.
+    That's policy, not drift, so runtime-load check should not fire."""
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    # No ERRORS, no runtime-load WARNINGS specifically.
+    runtime_load_warnings = [
+        w for w in validator.WARNINGS if "runtime-load check" in w
+    ]
+    assert validator.ERRORS == [], validator.ERRORS
+    assert runtime_load_warnings == [], runtime_load_warnings
+
+
+@_skip_no_runtime
+def test_valid_baseadapter_subclass_passes(validator, tmp_path, monkeypatch):
+    """The happy path: adapter.py defines a class inheriting from
+    BaseAdapter. All 8 production templates match this shape."""
+    adapter = (
+        "from molecule_runtime.adapters.base import BaseAdapter\n"
+        "\n"
+        "class MyAdapter(BaseAdapter):\n"
+        "    @staticmethod\n"
+        "    def name():\n"
+        "        return 'test-adapter'\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+@_skip_no_runtime
+def test_adapter_with_no_baseadapter_subclass_errors(validator, tmp_path, monkeypatch):
+    """The most insidious silent-failure mode: adapter.py imports
+    cleanly, defines classes, but NONE inherit from BaseAdapter. The
+    runtime's class-discovery would silently skip this file and fall
+    through to the default executor — workspace would 'work' but with
+    the wrong runtime. Must hard-error."""
+    adapter = (
+        "class JustSomePlainClass:\n"
+        "    def run(self): pass\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert any(
+        "no class inheriting from" in e and "BaseAdapter" in e
+        for e in validator.ERRORS
+    ), validator.ERRORS
+
+
+@_skip_no_runtime
+def test_adapter_with_syntax_error_errors(validator, tmp_path, monkeypatch):
+    """SyntaxError at import is the same failure mode that crashes
+    workspace boot. Catch it here."""
+    adapter = "this is not valid python at all\n"
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert any("failed to import" in e for e in validator.ERRORS), validator.ERRORS
+
+
+@_skip_no_runtime
+def test_adapter_with_import_error_errors(validator, tmp_path, monkeypatch):
+    """ImportError during adapter.py exec — same failure mode as
+    workspace boot. The error message should point the contributor at
+    requirements.txt as the right fix."""
+    adapter = (
+        "import this_package_definitely_does_not_exist_0xdeadbeef\n"
+        "from molecule_runtime.adapters.base import BaseAdapter\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert any(
+        "failed to import" in e and "ModuleNotFoundError" in e
+        for e in validator.ERRORS
+    ), validator.ERRORS
+
+
+def test_runtime_not_installed_warns_not_errors(validator, tmp_path, monkeypatch):
+    """If the validator runs in an env without molecule-ai-workspace-runtime,
+    we WARN (loud) but don't error — hard-erroring would say 'your adapter
+    is broken' when the actual issue is the CI infra. Mock the import to
+    simulate this regardless of what's installed locally."""
+    adapter = (
+        "from molecule_runtime.adapters.base import BaseAdapter\n"
+        "class A(BaseAdapter): pass\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+
+    # Force the runtime import to fail by hiding the module.
+    import sys
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules)
+             if k.startswith("molecule_runtime")}
+    saved_meta = sys.meta_path[:]
+    class _Block:
+        def find_spec(self, name, path=None, target=None):
+            if name == "molecule_runtime" or name.startswith("molecule_runtime."):
+                raise ImportError(f"blocked for test: {name}")
+            return None
+    sys.meta_path.insert(0, _Block())
+    try:
+        validator.check_adapter_runtime_load()
+    finally:
+        sys.meta_path[:] = saved_meta
+        sys.modules.update(saved)
+
+    assert validator.ERRORS == [], validator.ERRORS
+    assert any(
+        "skipping runtime-load check" in w
+        for w in validator.WARNINGS
+    ), validator.WARNINGS
