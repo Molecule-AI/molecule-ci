@@ -1,0 +1,131 @@
+name: Validate Go Plugin
+
+# Reusable workflow for Go-binary plugins in the Molecule org.
+#
+# Counterpart to validate-plugin.yml which is skill/prompt-shaped
+# (expects plugin.yaml + SKILL.md/hooks/skills/) and doesn't fit
+# Go binaries. Without this workflow each Go plugin had to copy the
+# same go-build/vet/test loop into its own ci.yml — drift was
+# guaranteed (e.g. one plugin shipped without `go mod tidy` diff
+# verification, another without `gofmt -l`). This is the canonical
+# floor; consumers add plugin-specific extras (e.g. shellcheck for
+# the wrapper scripts in gh-identity) on top.
+#
+# Consumer pattern (3-line per-plugin ci.yml):
+#
+#   jobs:
+#     secret-scan:
+#       uses: Molecule-AI/molecule-core/.github/workflows/secret-scan.yml@staging
+#     validate-go:
+#       uses: Molecule-AI/molecule-ci/.github/workflows/validate-go-plugin.yml@staging
+#
+# Inputs let plugins with non-standard package layouts opt in:
+#
+#   github-app-auth's cmd/ + pluginloader/ packages require the
+#   molecule-core platform module to compile (provisionhook.Registry
+#   is in molecule-core). Tests only target ./internal/... — the
+#   plugin's self-contained business logic. Pin via:
+#
+#     validate-go:
+#       uses: Molecule-AI/molecule-ci/.github/workflows/validate-go-plugin.yml@staging
+#       with:
+#         packages: ./internal/...
+#
+# Pin to @staging not @main — staging is the active default for
+# molecule-core's reusable workflows; main lags via the promotion
+# workflow. Keeps consumer workflows in lockstep with the canonical
+# secret-scan @staging pin documented in molecule-core/secret-scan.yml.
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "Go toolchain version. 1.25 is the org default."
+        type: string
+        required: false
+        default: "1.25"
+      packages:
+        description: "Go package selector for build/vet/test. Default ./... covers the whole module; override for plugins whose cmd/ requires external modules to compile."
+        type: string
+        required: false
+        default: "./..."
+
+jobs:
+  build-vet-test:
+    name: Go build, vet, test (-race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      # Pin go.mod + go.sum stability. Without this an unstable
+      # module graph (newly-added import that wasn't tidied) would
+      # only surface on the next consumer's CI — drift across PRs.
+      - name: go mod tidy (verify clean)
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod/go.sum drift detected. Run 'go mod tidy' locally and commit."
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ${{ inputs.packages }}
+
+      - name: go vet
+        run: go vet ${{ inputs.packages }}
+
+      # -race catches concurrency issues that aren't visible to vet.
+      # -count=1 disables the test cache so the gate is honest about
+      # what this commit actually exercises.
+      - name: go test (-race)
+        run: go test -race -count=1 ${{ inputs.packages }}
+
+  gofmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      # gofmt -l prints unformatted files; failing on non-empty
+      # output keeps the canonical formatting floor without needing
+      # a third-party action.
+      - name: gofmt -l
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Unformatted Go files (run 'gofmt -w'):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+  govulncheck:
+    name: govulncheck (Go CVE scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      # govulncheck reports known CVEs in transitive deps that the
+      # plugin's compiled binary actually reaches (it uses call-graph
+      # analysis, not just go.sum scanning, so the false-positive
+      # rate stays low). Fails CI on any reachable advisory; opt-out
+      # is to upgrade the dep, not silence the gate.
+      - name: govulncheck install
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: govulncheck run
+        run: govulncheck ${{ inputs.packages }}
