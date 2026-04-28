@@ -16,8 +16,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  statuses: read
+  contents: write          # push the fast-forward to main
+  statuses: read           # read commit status checks
+  administration: read     # read branch protection (required by the
+                           # reusable workflow — see its header for why)
 
 jobs:
   promote:
