@@ -81,6 +81,7 @@ jobs:
 Inputs:
 - `go-version` (default `"1.25"`)
 - `packages` (default `"./..."`) — pin narrower for plugins whose top-level cmd packages require external modules
+- `skip-mod-tidy` (default `false`) — opt-out for plugins whose `go.mod` uses a relative `replace` directive (e.g. `../molecule-monorepo/platform`); `go mod tidy` traverses every replace target and fails when the path doesn't exist in CI
 
 ### validate-workspace-template
 
