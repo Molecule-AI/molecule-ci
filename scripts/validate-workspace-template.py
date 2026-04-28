@@ -101,8 +101,36 @@ KNOWN_RUNTIMES = {
     "gemini-cli",
     "openclaw",
 }
-REQUIRED_KEYS = ["name", "runtime", "template_schema_version"]
-OPTIONAL_KEYS = [
+
+# ──────────────────────────────────────────── schema versioning
+#
+# `template_schema_version: int` in each template's config.yaml selects
+# which contract this validator enforces. Versions are FROZEN once
+# shipped — never edit a SCHEMA_V* constant in place. To bump:
+#
+#   1. Add `SCHEMA_V<N+1>_REQUIRED_KEYS` / `SCHEMA_V<N+1>_OPTIONAL_KEYS`
+#      describing the new contract.
+#   2. Add `_check_schema_v<N+1>(config)` that enforces it.
+#   3. Add the entry to SCHEMA_CHECKS below.
+#   4. Move version N from KNOWN_SCHEMA_VERSIONS to
+#      DEPRECATED_SCHEMA_VERSIONS so existing v<N> templates warn but
+#      still pass — buys a deprecation window.
+#   5. Ship a corresponding migration in scripts/migrate-template.py's
+#      MIGRATIONS table (key = N, value = callable that produces the
+#      v<N+1> dict from a v<N> dict).
+#   6. Run migrate-template.py on each consumer template repo as a PR.
+#   7. After all consumers migrate, drop version N from
+#      DEPRECATED_SCHEMA_VERSIONS in a follow-up PR.
+#
+# This discipline means a schema version always has exactly one valid
+# enforcement function, never "branch on minor variants" — the whole
+# point of versioning is to avoid that drift.
+
+KNOWN_SCHEMA_VERSIONS: set[int] = {1}
+DEPRECATED_SCHEMA_VERSIONS: set[int] = set()
+
+SCHEMA_V1_REQUIRED_KEYS = ["name", "runtime", "template_schema_version"]
+SCHEMA_V1_OPTIONAL_KEYS = [
     "description",
     "version",
     "tier",
@@ -120,6 +148,33 @@ OPTIONAL_KEYS = [
 ]
 
 
+def _check_schema_v1(config: dict) -> None:
+    """v1 contract — the keys frozen as of monorepo task #90's Phase 2.
+    Currently every production template runs this version. Do NOT edit
+    in place; add v2 instead and migrate consumers (see header)."""
+    for key in SCHEMA_V1_REQUIRED_KEYS:
+        if key not in config:
+            err(f"config.yaml: missing required key `{key}`")
+    runtime = config.get("runtime")
+    if runtime and runtime not in KNOWN_RUNTIMES:
+        warn(
+            f"config.yaml: runtime `{runtime}` not in known set "
+            f"{sorted(KNOWN_RUNTIMES)} — OK for custom runtimes; "
+            f"if canonical, add it to KNOWN_RUNTIMES in validate-workspace-template.py"
+        )
+    unknown = set(config.keys()) - set(SCHEMA_V1_REQUIRED_KEYS) - set(SCHEMA_V1_OPTIONAL_KEYS)
+    if unknown:
+        warn(
+            f"config.yaml: unknown top-level keys {sorted(unknown)} — "
+            f"may be drift. If intentional, add them to SCHEMA_V1_OPTIONAL_KEYS."
+        )
+
+
+SCHEMA_CHECKS = {
+    1: _check_schema_v1,
+}
+
+
 def check_config_yaml() -> None:
     if not os.path.isfile("config.yaml"):
         err("config.yaml: missing at repo root")
@@ -133,29 +188,40 @@ def check_config_yaml() -> None:
     if not isinstance(config, dict):
         err(f"config.yaml: root must be a mapping, got {type(config).__name__}")
         return
-    for key in REQUIRED_KEYS:
-        if key not in config:
-            err(f"config.yaml: missing required key `{key}`")
-    runtime = config.get("runtime")
-    if runtime and runtime not in KNOWN_RUNTIMES:
-        warn(
-            f"config.yaml: runtime `{runtime}` not in known set "
-            f"{sorted(KNOWN_RUNTIMES)} — OK for custom runtimes; "
-            f"if canonical, add it to KNOWN_RUNTIMES in validate-workspace-template.py"
-        )
+
+    # Schema-version dispatch. Validate the version field shape first
+    # so error messages are actionable.
     sv = config.get("template_schema_version")
-    if sv is not None and not isinstance(sv, int):
+    if sv is None:
+        err("config.yaml: missing required key `template_schema_version`")
+        # Can't dispatch without a version. Don't fall through to v1
+        # checks — that would mask the missing-version error.
+        return
+    if not isinstance(sv, int):
         err(
             f"config.yaml: template_schema_version must be int, "
             f"got {type(sv).__name__}={sv!r}"
         )
+        return
 
-    unknown = set(config.keys()) - set(REQUIRED_KEYS) - set(OPTIONAL_KEYS)
-    if unknown:
+    if sv in DEPRECATED_SCHEMA_VERSIONS:
+        latest = max(KNOWN_SCHEMA_VERSIONS)
         warn(
-            f"config.yaml: unknown top-level keys {sorted(unknown)} — "
-            f"may be drift. If intentional, add them to OPTIONAL_KEYS."
+            f"config.yaml: template_schema_version={sv} is deprecated; "
+            f"migrate to v{latest} via "
+            f"`python3 scripts/migrate-template.py --to {latest} .`. "
+            f"Support for v{sv} will be removed in a future cycle."
         )
+    elif sv not in KNOWN_SCHEMA_VERSIONS:
+        valid = sorted(KNOWN_SCHEMA_VERSIONS | DEPRECATED_SCHEMA_VERSIONS)
+        err(
+            f"config.yaml: template_schema_version={sv} is unknown — "
+            f"this validator understands {valid}. Either bump the "
+            f"validator (add a SCHEMA_V{sv} block) or correct the version."
+        )
+        return
+
+    SCHEMA_CHECKS[sv](config)
 
 
 # ───────────────────────────────────────────────────────────── requirements.txt
