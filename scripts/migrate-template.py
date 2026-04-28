@@ -32,11 +32,23 @@ Usage:
     # Dry-run: print the diff without writing
     python3 scripts/migrate-template.py --dry-run .
 
-The script preserves YAML round-trip fidelity for keys it doesn't
-touch (using ruamel.yaml when available; falling back to PyYAML's
-default representer otherwise). Migrations should ONLY mutate keys
-they're explicitly versioning — leave everything else alone so a
-consumer template's customizations survive.
+YAML round-trip caveats:
+  - PyYAML's safe_dump is used for output. Comments + anchor/alias
+    forms in the consumer's config.yaml are NOT preserved across
+    migrations — the migrated file is a clean re-emit. Templates
+    rarely have inline comments in config.yaml; on the rare occasion
+    they do, the maintainer needs to re-add them after migration.
+  - Keys are sorted alphabetically on output. This trades a one-time
+    re-ordering diff (reviewable) for stable diffs across future
+    migrations.
+  - Migrations should ONLY mutate keys they're explicitly versioning
+    — leave everything else alone so a consumer template's
+    customizations survive.
+
+A future enhancement could detect comments in the original file and
+opt into ruamel.yaml for round-trip-preserving emission. Not done
+today; flag in the migrator's stderr if comments are detected so the
+maintainer knows what they're losing.
 """
 from __future__ import annotations
 

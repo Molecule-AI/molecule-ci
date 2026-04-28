@@ -375,7 +375,34 @@ def test_adapter_with_no_baseadapter_subclass_errors(validator, tmp_path, monkey
     monkeypatch.chdir(tmp_path)
     validator.check_adapter_runtime_load()
     assert any(
-        "no class inheriting from" in e and "BaseAdapter" in e
+        "no concrete class inheriting from" in e and "BaseAdapter" in e
+        for e in validator.ERRORS
+    ), validator.ERRORS
+
+
+@_skip_no_runtime
+def test_only_imported_baseadapter_subclass_does_not_count(validator, tmp_path, monkeypatch):
+    """Re-exported imports do not satisfy the contract. If the only
+    BaseAdapter subclass in adapter.py is something `from
+    molecule_runtime.adapters.base import BaseAdapter` re-exports (or
+    a future abstract intermediate), the runtime's class-discovery
+    would correctly skip it — and the validator must too. Without
+    this check, an `__module__`-filter regression would mask the
+    'no concrete subclass' case the gate exists to catch.
+    """
+    adapter = (
+        # This file imports BaseAdapter but never SUBCLASSES it.
+        # `BaseAdapter` itself is in vars(mod) but it's already
+        # filtered by `obj is not BaseAdapter`. The new __module__
+        # filter ensures no third-party class slipping in via import
+        # is counted either.
+        "from molecule_runtime.adapters.base import BaseAdapter  # noqa: F401\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert any(
+        "no concrete class inheriting from" in e
         for e in validator.ERRORS
     ), validator.ERRORS
 
