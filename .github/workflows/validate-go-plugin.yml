@@ -49,6 +49,11 @@ on:
         type: string
         required: false
         default: "./..."
+      skip-mod-tidy:
+        description: "Skip the `go mod tidy` cleanliness gate. Set true for plugins whose go.mod uses a relative replace directive (e.g. ../molecule-monorepo/platform) that is unresolvable in CI — go mod tidy traverses every replace target and errors when the path doesn't exist. Default false."
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   build-vet-test:
@@ -65,7 +70,17 @@ jobs:
       # Pin go.mod + go.sum stability. Without this an unstable
       # module graph (newly-added import that wasn't tidied) would
       # only surface on the next consumer's CI — drift across PRs.
+      #
+      # skip-mod-tidy: opt-out for plugins whose go.mod has a
+      # relative `replace` directive (e.g. github-app-auth replaces
+      # molecule-monorepo with ../molecule-monorepo/platform).
+      # `go mod tidy` traverses every replace target and fails when
+      # the path isn't reachable — there's nothing the gate can do
+      # about that without unwiring the plugin's external-checkout
+      # dev workflow. The gate is preserved for the common case;
+      # opt-outs are noisy on purpose so a future fix is visible.
       - name: go mod tidy (verify clean)
+        if: ${{ !inputs.skip-mod-tidy }}
         run: |
           go mod tidy
           if ! git diff --exit-code go.mod go.sum; then
