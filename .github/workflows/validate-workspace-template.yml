@@ -23,24 +23,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # Cache pip against the calling repo's own requirements.txt
+          # (the file we install one step below). Pointing the cache key
+          # at the validator's own deps was decorative — pyyaml never
+          # changes, so the key never invalidated even when the template
+          # added a heavy dep like crewai.
           cache: "pip"
-          cache-dependency-path: .molecule-ci-canonical/.molecule-ci/scripts/requirements.txt
-      - run: pip install pyyaml -q
-      # Install the template's runtime dependencies so the validator's
-      # `check_adapter_runtime_load()` can import adapter.py the same way
-      # the workspace container does at boot. Without this, a
-      # syntactically-valid adapter that ImportErrors on a missing
-      # transitive dep would build clean and crash on first user prompt.
-      # The fallback (no requirements.txt) installs the runtime alone so
-      # BaseAdapter is at least importable for the class-discovery check.
-      - if: hashFiles('requirements.txt') != ''
-        run: pip install -q -r requirements.txt
-      - if: hashFiles('requirements.txt') == ''
-        run: pip install -q molecule-ai-workspace-runtime
-      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
-      - name: Docker build smoke test
-        if: hashFiles('Dockerfile') != ''
-        run: docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "✓ Docker build succeeded"
+          cache-dependency-path: requirements.txt
+      # Secret-scan runs FIRST, before any `pip install` could execute a
+      # post-install hook from a malicious dep added by a template PR.
+      # Same threat surface the Docker build smoke test already runs
+      # against (Dockerfile RUN steps execute before the secret-scan if
+      # the docker step were earlier), but cheap to keep ordered safely.
       - name: Check for secrets
         run: |
           python3 - << 'PYEOF'
@@ -90,3 +84,19 @@ jobs:
           else:
               print("::notice::No secrets detected")
           PYEOF
+      - run: pip install pyyaml -q
+      # Install the template's runtime dependencies so the validator's
+      # `check_adapter_runtime_load()` can import adapter.py the same way
+      # the workspace container does at boot. Without this, a
+      # syntactically-valid adapter that ImportErrors on a missing
+      # transitive dep would build clean and crash on first user prompt.
+      # The fallback (no requirements.txt) installs the runtime alone so
+      # BaseAdapter is at least importable for the class-discovery check.
+      - if: hashFiles('requirements.txt') != ''
+        run: pip install -q -r requirements.txt
+      - if: hashFiles('requirements.txt') == ''
+        run: pip install -q molecule-ai-workspace-runtime
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Docker build smoke test
+        if: hashFiles('Dockerfile') != ''
+        run: docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "✓ Docker build succeeded"

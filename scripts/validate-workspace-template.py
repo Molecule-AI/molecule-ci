@@ -129,6 +129,13 @@ KNOWN_RUNTIMES = {
 KNOWN_SCHEMA_VERSIONS: set[int] = {1}
 DEPRECATED_SCHEMA_VERSIONS: set[int] = set()
 
+# `template_schema_version` is part of the v1 contract and listed
+# here for documentation, but the top-level `check_config_yaml`
+# already verifies it's present and is an int before dispatching
+# here — `_check_schema_v1` does NOT re-check it (would be dead
+# defensive code). The key DOES need to appear in the union of
+# required + optional so it isn't flagged as unknown drift in the
+# `unknown top-level keys` warning at the end of `_check_schema_v1`.
 SCHEMA_V1_REQUIRED_KEYS = ["name", "runtime", "template_schema_version"]
 SCHEMA_V1_OPTIONAL_KEYS = [
     "description",
@@ -153,6 +160,10 @@ def _check_schema_v1(config: dict) -> None:
     Currently every production template runs this version. Do NOT edit
     in place; add v2 instead and migrate consumers (see header)."""
     for key in SCHEMA_V1_REQUIRED_KEYS:
+        if key == "template_schema_version":
+            # Already verified present + int by the dispatcher; skip
+            # to avoid emitting a duplicate or contradictory error.
+            continue
         if key not in config:
             err(f"config.yaml: missing required key `{key}`")
     runtime = config.get("runtime")
@@ -303,13 +314,18 @@ def check_adapter_runtime_load() -> None:
         )
         return
 
-    # Load adapter.py as a module under a unique name so it doesn't
-    # collide with any installed `adapter` package or with a previous
-    # invocation in the same Python process.
+    # Load adapter.py as a module under a per-call-unique name so it
+    # doesn't collide with any installed `adapter` package OR with a
+    # previous invocation in the same Python process. The id() of the
+    # cwd-anchored absolute path is sufficient — we just need
+    # different invocations to land on different sys.modules keys so
+    # one invocation's lingering references can't bleed into the
+    # next's adapter discovery.
     import importlib.util  # noqa: PLC0415
     import sys             # noqa: PLC0415
 
-    module_name = "_template_adapter_under_validation"
+    abs_path = os.path.abspath("adapter.py")
+    module_name = f"_template_adapter_under_validation_{abs(hash(abs_path)):x}"
     spec = importlib.util.spec_from_file_location(module_name, "adapter.py")
     if spec is None or spec.loader is None:
         err("adapter.py: cannot construct an import spec — file may be unreadable")
@@ -333,23 +349,34 @@ def check_adapter_runtime_load() -> None:
         sys.modules.pop(module_name, None)
         return
 
+    # Class discovery: only count classes DEFINED in adapter.py, not
+    # re-exported imports. Without the `__module__` filter, a template
+    # that does `from molecule_runtime.adapters.base import
+    # AbstractCLIAdapter` (or any future abstract intermediate the
+    # runtime exposes) would have that import counted as a "real"
+    # adapter — masking the genuine "no concrete subclass" case the
+    # whole check is meant to catch.
     adapter_classes = [
         obj
         for name, obj in vars(mod).items()
         if isinstance(obj, type)
         and obj is not BaseAdapter
         and issubclass(obj, BaseAdapter)
+        and getattr(obj, "__module__", None) == module_name
     ]
     sys.modules.pop(module_name, None)
 
     if not adapter_classes:
         err(
-            "adapter.py: no class inheriting from "
-            "`molecule_runtime.adapters.base.BaseAdapter` found. "
-            "The runtime resolves the adapter via class discovery — "
-            "without a BaseAdapter subclass, workspace boot falls "
-            "through to the default langgraph executor and ignores "
-            "this file silently. If that's intentional, delete adapter.py."
+            "adapter.py: no concrete class inheriting from "
+            "`molecule_runtime.adapters.base.BaseAdapter` defined "
+            "in this file. The runtime resolves the adapter via "
+            "class discovery on adapter.py's own definitions — "
+            "imports of base classes from molecule_runtime do not "
+            "count. Without a concrete subclass DEFINED here, "
+            "workspace boot falls through to the default langgraph "
+            "executor and ignores this file silently. If that's "
+            "intentional, delete adapter.py."
         )
 
 
