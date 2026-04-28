@@ -16,8 +16,9 @@ name: Auto-promote branch (reusable)
 #       branches: [staging]
 #     workflow_dispatch:
 #   permissions:
-#     contents: write
-#     statuses: read
+#     contents: write          # push the fast-forward to to-branch
+#     statuses: read           # read commit status checks
+#     administration: read     # read branch protection (REQUIRED — see below)
 #   jobs:
 #     promote:
 #       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-branch.yml@main
@@ -27,6 +28,14 @@ name: Auto-promote branch (reusable)
 #
 # Repo-agnostic by design — gates are read from the consuming repo's
 # branch protection at run time, not hardcoded here.
+#
+# `administration: read` is REQUIRED. Without it, the branch-protection
+# API returns 403 and the workflow refuses to fast-forward (fail-loud),
+# rather than silently degrading to --ff-only-only enforcement (which
+# is ancestry-only, not test-status — a green-but-flaky branch would
+# ff-promote red commits). If you intentionally want no-gate
+# enforcement, leave from-branch unprotected — a 404 from the API is
+# treated as "no gates configured" and falls back to --ff-only safety.
 #
 # Excluded-by-policy repos (molecule-core + molecule-controlplane per
 # CEO directive 2026-04-24) simply do not adopt this workflow; the
@@ -70,13 +79,72 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Try to read required gates from branch protection. Free-tier
-          # private repos may 403; handle that gracefully.
-          GATES_JSON=$(gh api "repos/${REPO}/branches/${FROM_BRANCH}/protection/required_status_checks" 2>/dev/null || echo '{}')
+          # Read required gates from branch protection. Three response
+          # classes, distinguished by HTTP status:
+          #
+          #   200 — branch protection is configured. Honor the gates.
+          #   404 — branch is not protected. Legitimate "no gates";
+          #         fall back to --ff-only as the sole safety net.
+          #   403 — caller's GITHUB_TOKEN can't read branch protection.
+          #         FAIL LOUD. The previous behavior conflated this
+          #         with 404 ("api inaccessible") and silently degraded
+          #         to --ff-only-only — which is ancestry-only, not
+          #         test-status. A green-but-flaky branch would
+          #         ff-promote red commits to the target. The fix:
+          #         require the caller to add `administration: read`
+          #         to its permissions block, or explicitly accept the
+          #         no-gates posture by removing branch protection on
+          #         the source branch.
+          #
+          # `gh api` exit code is 0 only on 2xx; non-zero on anything
+          # else. We use --include to capture HTTP status to discriminate.
+
+          if PROTECTION_RESP=$(gh api -i "repos/${REPO}/branches/${FROM_BRANCH}/protection/required_status_checks" 2>&1); then
+            HTTP_STATUS=200
+          else
+            HTTP_STATUS=$(echo "$PROTECTION_RESP" | grep -oE '^HTTP/[12](\.[01])? [0-9]{3}' | awk '{print $2}' | head -1)
+            HTTP_STATUS=${HTTP_STATUS:-unknown}
+          fi
+
+          case "$HTTP_STATUS" in
+            200)
+              # Strip headers from gh -i output to get just the body.
+              GATES_JSON=$(echo "$PROTECTION_RESP" | awk 'p{print} /^[[:space:]]*$/ && !p {p=1}')
+              ;;
+            404)
+              echo "::notice::No branch protection on '${FROM_BRANCH}' — relying on --ff-only safety."
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            403|401)
+              echo "::error::Cannot read branch protection on '${FROM_BRANCH}' (HTTP ${HTTP_STATUS})."
+              echo "::error::Caller's GITHUB_TOKEN lacks 'administration: read' permission."
+              echo "::error::Refusing to fast-forward without explicit gate enforcement —"
+              echo "::error::a silent fallback to --ff-only here would let green-but-flaky"
+              echo "::error::branches promote red commits."
+              echo "::error::"
+              echo "::error::Fix: add to the caller's workflow's permissions block:"
+              echo "::error::  permissions:"
+              echo "::error::    contents: write"
+              echo "::error::    statuses: read"
+              echo "::error::    administration: read"
+              echo "::error::"
+              echo "::error::Or, if you intentionally want no-gate enforcement, remove"
+              echo "::error::branch protection on '${FROM_BRANCH}' so the API returns 404."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected HTTP status '${HTTP_STATUS}' from branch-protection API."
+              echo "::error::Response (first 5 lines):"
+              echo "$PROTECTION_RESP" | head -5 | sed 's/^/::error::  /'
+              exit 1
+              ;;
+          esac
+
           GATES=$(echo "${GATES_JSON}" | jq -r '.contexts[]?' 2>/dev/null || true)
 
           if [ -z "$GATES" ]; then
-            echo "No required gates configured on '${FROM_BRANCH}' (or API inaccessible). Relying on --ff-only safety."
+            echo "::notice::Branch protection on '${FROM_BRANCH}' has zero required-status-checks contexts — relying on --ff-only safety."
             echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
