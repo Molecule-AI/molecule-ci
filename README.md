@@ -6,6 +6,8 @@ Shared CI workflows for the Molecule AI ecosystem. Every plugin, workspace templ
 
 ### Plugin repos (`molecule-ai-plugin-*`)
 
+Skill/prompt-shaped plugins (the majority — Python with `plugin.yaml` + `SKILL.md`/`hooks`/`skills`/`rules`):
+
 ```yaml
 # .github/workflows/ci.yml
 name: CI
@@ -13,6 +15,21 @@ on: [push, pull_request]
 jobs:
   validate:
     uses: Molecule-AI/molecule-ci/.github/workflows/validate-plugin.yml@main
+```
+
+Go-binary plugins (compiled `provisionhook.Registry` registrants — `molecule-ai-plugin-gh-identity`, `molecule-ai-plugin-github-app-auth`):
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+jobs:
+  secret-scan:
+    uses: Molecule-AI/molecule-core/.github/workflows/secret-scan.yml@staging
+  validate-go:
+    uses: Molecule-AI/molecule-ci/.github/workflows/validate-go-plugin.yml@staging
+    # with:
+    #   packages: ./internal/...   # narrower test scope when cmd/ requires external modules
 ```
 
 ### Workspace template repos (`molecule-ai-workspace-template-*`)
@@ -49,6 +66,21 @@ jobs:
 | SKILL.md starts with heading | Warning | Bad formatting |
 | No committed secrets | Error | Leaked API keys |
 | No build artifacts | Error | node_modules, __pycache__ |
+
+### validate-go-plugin
+
+| Check | Severity | What it catches |
+|---|---|---|
+| `go mod tidy` clean | Error | Drifting go.mod/go.sum |
+| `go build` | Error | Broken compile |
+| `go vet` | Error | Suspicious constructs |
+| `go test -race -count=1` | Error | Concurrency bugs + cache lies |
+| `gofmt -l` | Error | Unformatted files |
+| `govulncheck` | Error | Reachable CVEs in deps |
+
+Inputs:
+- `go-version` (default `"1.25"`)
+- `packages` (default `"./..."`) — pin narrower for plugins whose top-level cmd packages require external modules
 
 ### validate-workspace-template
 
