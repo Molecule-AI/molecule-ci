@@ -17,7 +17,7 @@ name: Publish Workspace Template Image
 #     packages: write
 #   jobs:
 #     publish:
-#       uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
+#       uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@v1
 #       secrets: inherit
 #
 # Runner choice (2026-04-22): ubuntu-latest

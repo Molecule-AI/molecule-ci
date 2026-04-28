@@ -21,13 +21,21 @@ name: Auto-promote branch (reusable)
 #     administration: read     # read branch protection (REQUIRED — see below)
 #   jobs:
 #     promote:
-#       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-branch.yml@main
+#       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-branch.yml@v1
 #       with:
 #         from-branch: staging
 #         to-branch: main
 #
 # Repo-agnostic by design — gates are read from the consuming repo's
 # branch protection at run time, not hardcoded here.
+#
+# `@v1` is a moving tag pointing at the latest 1.x release of
+# molecule-ci's reusable workflows (GitHub Actions convention, same
+# as `actions/checkout@v4`). Breaking changes get a new `@v2` tag
+# and the old `@v1` keeps working for existing consumers. Pinning to
+# `@main` is also accepted for forward-compat preview but is
+# unstable — any change merged here rolls out instantly to consumers
+# without a release boundary.
 #
 # `administration: read` is REQUIRED. Without it, the branch-protection
 # API returns 403 and the workflow refuses to fast-forward (fail-loud),
