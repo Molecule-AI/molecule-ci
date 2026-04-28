@@ -1,0 +1,143 @@
+name: Auto-promote branch (reusable)
+
+# Reusable version of the auto-promote-staging workflow that lived
+# directly in molecule-ci. Any repo with a `from-branch` (typically
+# `staging`) → `to-branch` (typically `main`) flow can call this
+# workflow to fast-forward `to-branch` whenever `from-branch` is
+# strictly ahead AND all configured required-status-checks on the
+# `from-branch` HEAD are green.
+#
+# Adoption pattern in a consumer repo:
+#
+#   # .github/workflows/auto-promote.yml
+#   name: Auto-promote staging → main
+#   on:
+#     push:
+#       branches: [staging]
+#     workflow_dispatch:
+#   permissions:
+#     contents: write
+#     statuses: read
+#   jobs:
+#     promote:
+#       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-branch.yml@main
+#       with:
+#         from-branch: staging
+#         to-branch: main
+#
+# Repo-agnostic by design — gates are read from the consuming repo's
+# branch protection at run time, not hardcoded here.
+#
+# Excluded-by-policy repos (molecule-core + molecule-controlplane per
+# CEO directive 2026-04-24) simply do not adopt this workflow; the
+# reusable shape adds no surface area to repos that don't call it.
+
+on:
+  workflow_call:
+    inputs:
+      from-branch:
+        description: "Source branch with green CI"
+        required: false
+        default: staging
+        type: string
+      to-branch:
+        description: "Target branch to fast-forward"
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: write
+  statuses: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check required gates (if configured) on source HEAD
+        id: gates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+          FROM_BRANCH: ${{ inputs.from-branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Try to read required gates from branch protection. Free-tier
+          # private repos may 403; handle that gracefully.
+          GATES_JSON=$(gh api "repos/${REPO}/branches/${FROM_BRANCH}/protection/required_status_checks" 2>/dev/null || echo '{}')
+          GATES=$(echo "${GATES_JSON}" | jq -r '.contexts[]?' 2>/dev/null || true)
+
+          if [ -z "$GATES" ]; then
+            echo "No required gates configured on '${FROM_BRANCH}' (or API inaccessible). Relying on --ff-only safety."
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Required gates on '${FROM_BRANCH}':"
+          echo "${GATES}" | sed 's/^/  - /'
+
+          ALL_GREEN=true
+          while IFS= read -r gate; do
+            [ -z "$gate" ] && continue
+
+            conclusion=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+                          --jq "[.check_runs[] | select(.name == \"${gate}\")] | sort_by(.completed_at) | last.conclusion" \
+                          2>/dev/null || echo "")
+
+            if [ -z "$conclusion" ] || [ "$conclusion" = "null" ]; then
+              conclusion=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/status" \
+                            --jq "[.statuses[] | select(.context == \"${gate}\")] | sort_by(.updated_at) | last.state" \
+                            2>/dev/null || echo "")
+            fi
+
+            if [ "$conclusion" != "success" ] && [ "$conclusion" != "SUCCESS" ]; then
+              echo "::warning::Gate '${gate}' is '${conclusion:-missing}' on ${HEAD_SHA} — skipping promote."
+              ALL_GREEN=false
+            else
+              echo "  ✓ ${gate}: success"
+            fi
+          done <<< "$GATES"
+
+          echo "ok=${ALL_GREEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Fast-forward target branch to source HEAD
+        if: steps.gates.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FROM_BRANCH: ${{ inputs.from-branch }}
+          TO_BRANCH: ${{ inputs.to-branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+
+          # Source branch is what's checked out (workflow fires on push to
+          # source). Can't fetch into it. Fetch target into a local target.
+          git fetch origin "${TO_BRANCH}"
+          git checkout -B "${TO_BRANCH}" "origin/${TO_BRANCH}"
+
+          # Check if target is already at or ahead of source.
+          if git merge-base --is-ancestor "origin/${FROM_BRANCH}" "${TO_BRANCH}" 2>/dev/null; then
+            echo "${TO_BRANCH} already contains ${FROM_BRANCH}; nothing to promote."
+            exit 0
+          fi
+
+          # --ff-only refuses if target has independent commits not on
+          # source (divergence — hotfix direct to target). Human resolves.
+          if ! git merge --ff-only "origin/${FROM_BRANCH}" 2>&1; then
+            echo "::warning::${TO_BRANCH} has diverged from ${FROM_BRANCH} — refusing fast-forward. Resolve manually (likely a direct-to-${TO_BRANCH} commit exists that ${FROM_BRANCH} doesn't have)."
+            exit 0
+          fi
+
+          git push origin "${TO_BRANCH}"
+          echo "::notice::Promoted: ${TO_BRANCH} is now at $(git rev-parse --short HEAD)"
