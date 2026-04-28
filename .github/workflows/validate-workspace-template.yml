@@ -2,6 +2,22 @@ name: Validate Workspace Template
 on:
   workflow_call:
 
+# Defense-in-depth on the GITHUB_TOKEN scope. This workflow runs
+# untrusted-by-design code from the calling template repo — pip
+# installs the template's requirements.txt (post-install hooks),
+# imports adapter.py, and `docker build`s the Dockerfile (RUN
+# steps). Each of those primitives can execute arbitrary code with
+# the token in env. Pinning `contents: read` means the worst a
+# malicious template PR can do with the token is read public repo
+# state — no write to issues, no push to branches, no comment-spam,
+# no workflow re-trigger.
+#
+# Note: this is only a partial mitigation. The deeper lockdown is
+# `pull_request_target` discipline (consume the diff but don't
+# execute it from the PR's context) — tracked as a separate task.
+permissions:
+  contents: read
+
 jobs:
   validate:
     name: Template validation

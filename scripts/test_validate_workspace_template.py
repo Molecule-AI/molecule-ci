@@ -342,19 +342,32 @@ def test_no_adapter_skips_runtime_load_silently(validator, tmp_path, monkeypatch
     assert runtime_load_warnings == [], runtime_load_warnings
 
 
-@_skip_no_runtime
-def test_valid_baseadapter_subclass_passes(validator, tmp_path, monkeypatch):
-    """The happy path: adapter.py defines a class inheriting from
-    BaseAdapter. All 8 production templates match this shape."""
-    adapter = (
+def _good_adapter_py() -> str:
+    """A fully concrete BaseAdapter subclass — overrides every
+    abstract method BaseAdapter declares. Mirrors the shape of all 8
+    production templates so tests of the runtime-load check exercise
+    the same path the real templates do."""
+    return (
         "from molecule_runtime.adapters.base import BaseAdapter\n"
         "\n"
         "class MyAdapter(BaseAdapter):\n"
         "    @staticmethod\n"
-        "    def name():\n"
-        "        return 'test-adapter'\n"
+        "    def name(): return 'test-adapter'\n"
+        "    @staticmethod\n"
+        "    def display_name(): return 'Test'\n"
+        "    @staticmethod\n"
+        "    def description(): return 'fixture adapter'\n"
+        "    def setup(self, config): pass\n"
+        "    def create_executor(self, config): return None\n"
     )
-    _materialise(tmp_path, adapter_py=adapter)
+
+
+@_skip_no_runtime
+def test_valid_baseadapter_subclass_passes(validator, tmp_path, monkeypatch):
+    """The happy path: adapter.py defines a fully concrete class
+    inheriting from BaseAdapter. All 8 production templates match
+    this shape."""
+    _materialise(tmp_path, adapter_py=_good_adapter_py())
     monkeypatch.chdir(tmp_path)
     validator.check_adapter_runtime_load()
     assert validator.ERRORS == [], validator.ERRORS
@@ -378,6 +391,120 @@ def test_adapter_with_no_baseadapter_subclass_errors(validator, tmp_path, monkey
         "no concrete class inheriting from" in e and "BaseAdapter" in e
         for e in validator.ERRORS
     ), validator.ERRORS
+
+
+@_skip_no_runtime
+def test_abstract_intermediate_alone_does_not_count(validator, tmp_path, monkeypatch):
+    """A locally-defined abstract subclass (e.g., a framework-level
+    intermediate that templates extend) must not satisfy the contract
+    on its own. The runtime needs a CONCRETE class to instantiate;
+    accepting an abstract one would let workspace boot fail at
+    instantiation time instead of validator time."""
+    adapter = (
+        "from abc import abstractmethod\n"
+        "from molecule_runtime.adapters.base import BaseAdapter\n"
+        "\n"
+        "class FrameworkAdapter(BaseAdapter):\n"
+        "    @abstractmethod\n"
+        "    def my_abstract_method(self): ...\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert any(
+        "no concrete class inheriting from" in e
+        for e in validator.ERRORS
+    ), validator.ERRORS
+
+
+@_skip_no_runtime
+def test_abstract_plus_concrete_passes_with_concrete_only(validator, tmp_path, monkeypatch):
+    """The legitimate factoring pattern: define an abstract framework-
+    level intermediate, then a concrete leaf. Only the concrete leaf
+    counts toward the "at least one" requirement — the framework
+    intermediate is filtered out by `inspect.isabstract`."""
+    adapter = (
+        "from abc import abstractmethod\n"
+        "from molecule_runtime.adapters.base import BaseAdapter\n"
+        "\n"
+        "class FrameworkAdapter(BaseAdapter):\n"
+        "    @abstractmethod\n"
+        "    def framework_specific_hook(self): ...\n"
+        "\n"
+        "class ConcreteAdapter(FrameworkAdapter):\n"
+        "    def framework_specific_hook(self): pass\n"
+        "    @staticmethod\n"
+        "    def name(): return 'concrete'\n"
+        "    @staticmethod\n"
+        "    def display_name(): return 'Concrete'\n"
+        "    @staticmethod\n"
+        "    def description(): return 'leaf'\n"
+        "    def setup(self, config): pass\n"
+        "    def create_executor(self, config): return None\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+@_skip_no_runtime
+def test_multiple_concrete_baseadapter_subclasses_errors(validator, tmp_path, monkeypatch):
+    """Two concrete BaseAdapter subclasses in the same file is a
+    silent ambiguity: the runtime's class-discovery picks one per
+    its own resolution rules, so the WRONG class might be loaded
+    after a future runtime refactor. Force the maintainer to either
+    mark intermediates abstract or split into separate modules."""
+    adapter = (
+        "from molecule_runtime.adapters.base import BaseAdapter\n"
+        "\n"
+        "class FirstConcreteAdapter(BaseAdapter):\n"
+        "    @staticmethod\n"
+        "    def name(): return 'first'\n"
+        "    @staticmethod\n"
+        "    def display_name(): return 'First'\n"
+        "    @staticmethod\n"
+        "    def description(): return 'first'\n"
+        "    def setup(self, config): pass\n"
+        "    def create_executor(self, config): return None\n"
+        "\n"
+        "class SecondConcreteAdapter(BaseAdapter):\n"
+        "    @staticmethod\n"
+        "    def name(): return 'second'\n"
+        "    @staticmethod\n"
+        "    def display_name(): return 'Second'\n"
+        "    @staticmethod\n"
+        "    def description(): return 'second'\n"
+        "    def setup(self, config): pass\n"
+        "    def create_executor(self, config): return None\n"
+    )
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    multi_errors = [
+        e for e in validator.ERRORS
+        if "multiple concrete BaseAdapter subclasses" in e
+    ]
+    assert len(multi_errors) == 1, validator.ERRORS
+    # Both names should appear in the error so the operator knows
+    # exactly which classes are competing.
+    assert "FirstConcreteAdapter" in multi_errors[0]
+    assert "SecondConcreteAdapter" in multi_errors[0]
+
+
+@_skip_no_runtime
+def test_aliased_concrete_class_is_deduplicated(validator, tmp_path, monkeypatch):
+    """Production templates often do `Adapter = ConcreteAdapter` as a
+    module-level alias for the runtime's class-discovery convention.
+    `vars(mod)` returns BOTH bindings pointing at the same class
+    object — without identity-based dedup, the multi-concrete-class
+    error fires falsely (regression caught against the real langgraph
+    template during the Q3 fix). Pin that aliased templates pass."""
+    adapter = _good_adapter_py() + "\nAdapter = MyAdapter\n"
+    _materialise(tmp_path, adapter_py=adapter)
+    monkeypatch.chdir(tmp_path)
+    validator.check_adapter_runtime_load()
+    assert validator.ERRORS == [], validator.ERRORS
 
 
 @_skip_no_runtime
