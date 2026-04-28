@@ -349,21 +349,34 @@ def check_adapter_runtime_load() -> None:
         sys.modules.pop(module_name, None)
         return
 
-    # Class discovery: only count classes DEFINED in adapter.py, not
-    # re-exported imports. Without the `__module__` filter, a template
-    # that does `from molecule_runtime.adapters.base import
-    # AbstractCLIAdapter` (or any future abstract intermediate the
-    # runtime exposes) would have that import counted as a "real"
-    # adapter — masking the genuine "no concrete subclass" case the
-    # whole check is meant to catch.
-    adapter_classes = [
-        obj
+    # Class discovery: only count CONCRETE classes DEFINED in
+    # adapter.py, not re-exported imports and not abstract
+    # intermediates. Three filter axes:
+    #
+    #   1. `__module__ == module_name` — defined HERE, not imported
+    #      from molecule_runtime or a third-party framework.
+    #   2. `obj is not BaseAdapter` — BaseAdapter itself doesn't count.
+    #   3. `not inspect.isabstract(obj)` — abstract intermediates
+    #      defined locally don't count. Catches the
+    #      `class Framework(BaseAdapter): pass` + `class Concrete(Framework):`
+    #      pattern where vars(mod) has BOTH and we'd otherwise count
+    #      both as "real" adapters.
+    import inspect  # noqa: PLC0415
+    # Deduplicate by class identity. Many production adapters do
+    # `Adapter = ConcreteAdapter` as a module-level alias for the
+    # runtime's discovery — `vars(mod)` returns both bindings
+    # (`Adapter` AND `ConcreteAdapter`) pointing at the same class
+    # object. Without dedup, the multiple-concrete-subclasses
+    # error fires falsely on every aliased template.
+    adapter_classes = list({
+        id(obj): obj
         for name, obj in vars(mod).items()
         if isinstance(obj, type)
         and obj is not BaseAdapter
         and issubclass(obj, BaseAdapter)
         and getattr(obj, "__module__", None) == module_name
-    ]
+        and not inspect.isabstract(obj)
+    }.values())
     sys.modules.pop(module_name, None)
 
     if not adapter_classes:
@@ -373,10 +386,26 @@ def check_adapter_runtime_load() -> None:
             "in this file. The runtime resolves the adapter via "
             "class discovery on adapter.py's own definitions — "
             "imports of base classes from molecule_runtime do not "
-            "count. Without a concrete subclass DEFINED here, "
-            "workspace boot falls through to the default langgraph "
-            "executor and ignores this file silently. If that's "
-            "intentional, delete adapter.py."
+            "count, and abstract intermediates do not count. "
+            "Without a concrete subclass DEFINED here, workspace "
+            "boot falls through to the default langgraph executor "
+            "and ignores this file silently. If that's intentional, "
+            "delete adapter.py."
+        )
+        return
+
+    if len(adapter_classes) > 1:
+        names = sorted(c.__name__ for c in adapter_classes)
+        err(
+            f"adapter.py: multiple concrete BaseAdapter subclasses "
+            f"defined: {names}. The runtime's class-discovery picks "
+            f"one per its own resolution rules (typically last-defined "
+            f"or first-by-iteration), so shipping more than one is a "
+            f"silent ambiguity — the wrong class might be loaded after "
+            f"a future runtime refactor. Either keep exactly one "
+            f"concrete subclass + mark the others abstract via "
+            f"`abc.ABC` / abstract methods, or move them to separate "
+            f"importable modules."
         )
 
 
