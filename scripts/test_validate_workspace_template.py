@@ -200,13 +200,40 @@ def test_missing_entrypoint_errors(validator, tmp_path, monkeypatch):
 # ───────────────────────────────────────────────────────── config.yaml drift
 
 def test_missing_required_keys_errors(validator, tmp_path, monkeypatch):
+    """A config without template_schema_version short-circuits with a
+    SINGLE actionable error — listing 'also name and runtime are
+    missing' is noise on top of the real problem (no version means the
+    validator can't pick a schema contract to enforce). Once the
+    version is present, the v1 dispatch will list the other missing
+    keys (next test pins that)."""
     cfg = "description: only description, no name/runtime/version\n"
     _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
                  requirements=_good_requirements_txt())
     monkeypatch.chdir(tmp_path)
     validator.check_config_yaml()
     missing_msgs = [e for e in validator.ERRORS if "missing required key" in e]
-    assert len(missing_msgs) >= 3  # name, runtime, template_schema_version
+    # Exactly one error: the missing version. v1 dispatch is skipped
+    # because we can't choose a contract without a version.
+    assert len(missing_msgs) == 1, missing_msgs
+    assert "template_schema_version" in missing_msgs[0]
+
+
+def test_missing_required_keys_under_v1_dispatch_errors(validator, tmp_path, monkeypatch):
+    """When `template_schema_version: 1` IS present but other required
+    keys are missing, the v1 dispatch fires and lists them. Pins that
+    the v1 contract still enforces name + runtime."""
+    cfg = (
+        "template_schema_version: 1\n"
+        "description: only the version + description\n"
+    )
+    _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
+                 requirements=_good_requirements_txt())
+    monkeypatch.chdir(tmp_path)
+    validator.check_config_yaml()
+    missing_msgs = [e for e in validator.ERRORS if "missing required key" in e]
+    keys = {e.split("`")[1] for e in missing_msgs}
+    assert "name" in keys, missing_msgs
+    assert "runtime" in keys, missing_msgs
 
 
 def test_string_template_schema_version_errors(validator, tmp_path, monkeypatch):
@@ -380,6 +407,93 @@ def test_adapter_with_import_error_errors(validator, tmp_path, monkeypatch):
         "failed to import" in e and "ModuleNotFoundError" in e
         for e in validator.ERRORS
     ), validator.ERRORS
+
+
+# ─────────────────────────────────────── schema-version dispatch
+#
+# Pin the contract that the validator routes to per-version checks
+# based on `template_schema_version`, that unknown versions hard-fail,
+# and that deprecated versions warn but pass.
+
+def test_v1_is_in_known_schema_versions(validator):
+    """Document the floor: v1 is always understood. Future bumps add
+    versions; v1 stays accepted (or deprecated) but the validator
+    never silently drops it."""
+    assert 1 in validator.KNOWN_SCHEMA_VERSIONS or 1 in validator.DEPRECATED_SCHEMA_VERSIONS
+
+
+def test_unknown_schema_version_errors(validator, tmp_path, monkeypatch):
+    """A template declaring template_schema_version=999 must hard-fail
+    — silently allowing it would let drift land disguised as a
+    'future' version."""
+    cfg = (
+        "name: t\n"
+        "runtime: claude-code\n"
+        "template_schema_version: 999\n"
+    )
+    _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
+                 requirements=_good_requirements_txt())
+    monkeypatch.chdir(tmp_path)
+    validator.check_config_yaml()
+    assert any("template_schema_version=999 is unknown" in e
+               for e in validator.ERRORS), validator.ERRORS
+
+
+def test_deprecated_schema_version_warns_but_passes(validator, tmp_path, monkeypatch):
+    """During a deprecation window, v<N-1> templates still validate
+    (so the consumer can keep merging unrelated PRs while migrating)
+    but the warning surfaces the migration command."""
+    # Inject a fake deprecated version for the duration of this test —
+    # we don't have a real deprecated version yet (only v1 exists).
+    validator.KNOWN_SCHEMA_VERSIONS.add(2)
+    validator.DEPRECATED_SCHEMA_VERSIONS.add(1)
+    validator.SCHEMA_CHECKS[2] = lambda config: None  # accept-all stub for v2
+
+    try:
+        cfg = (
+            "name: t\n"
+            "runtime: claude-code\n"
+            "template_schema_version: 1\n"
+        )
+        _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
+                     requirements=_good_requirements_txt())
+        monkeypatch.chdir(tmp_path)
+        validator.check_config_yaml()
+        # No errors — deprecation is warning-only.
+        assert validator.ERRORS == [], validator.ERRORS
+        assert any(
+            "template_schema_version=1 is deprecated" in w
+            and "migrate-template.py" in w
+            for w in validator.WARNINGS
+        ), validator.WARNINGS
+    finally:
+        validator.KNOWN_SCHEMA_VERSIONS.discard(2)
+        validator.DEPRECATED_SCHEMA_VERSIONS.discard(1)
+        validator.SCHEMA_CHECKS.pop(2, None)
+
+
+def test_per_version_dispatch_calls_correct_check(validator, tmp_path, monkeypatch):
+    """Pin that SCHEMA_CHECKS[N] is the function called when a template
+    declares template_schema_version=N. Without this, the dispatch could
+    fire the wrong contract on a multi-version codebase."""
+    called: list[int] = []
+    validator.KNOWN_SCHEMA_VERSIONS.add(7)
+    validator.SCHEMA_CHECKS[7] = lambda config: called.append(7)
+
+    try:
+        cfg = (
+            "name: t\n"
+            "runtime: claude-code\n"
+            "template_schema_version: 7\n"
+        )
+        _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
+                     requirements=_good_requirements_txt())
+        monkeypatch.chdir(tmp_path)
+        validator.check_config_yaml()
+        assert called == [7], f"v7 dispatch was not invoked; called={called}"
+    finally:
+        validator.KNOWN_SCHEMA_VERSIONS.discard(7)
+        validator.SCHEMA_CHECKS.pop(7, None)
 
 
 def test_runtime_not_installed_warns_not_errors(validator, tmp_path, monkeypatch):
