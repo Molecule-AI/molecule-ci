@@ -12,17 +12,39 @@ on:
 # state — no write to issues, no push to branches, no comment-spam,
 # no workflow re-trigger.
 #
-# Note: this is only a partial mitigation. The deeper lockdown is
-# `pull_request_target` discipline (consume the diff but don't
-# execute it from the PR's context) — tracked as a separate task.
+# Fork-PR lockdown (#135): the workflow splits into two jobs:
+#
+#   validate-static  — file-content checks only (secret scan, YAML
+#                      parse, AST inspection of adapter.py without
+#                      import). Always runs, including external fork
+#                      PRs. Safe because no third-party code executes.
+#
+#   validate-runtime — pip install requirements.txt + import
+#                      adapter.py + docker build. SKIPPED on fork
+#                      PRs because each step is arbitrary code
+#                      execution from the template repo's perspective.
+#                      Internal PRs and post-merge runs still get
+#                      the full coverage.
+#
+# What this prevents: a malicious external PR can no longer
+# crypto-mine on the runner, DNS-exfiltrate runner metadata, or
+# attempt to read GitHub-Actions internal env via a setup.py
+# postinstall hook. They still get static feedback (secret scan
+# is the most important security check anyway).
+#
+# What this does NOT prevent: malicious template metadata that
+# passes static checks. The runtime job catches those once the PR
+# merges (or an internal contributor reposts the change), at which
+# point branch protection on staging/main blocks the merge if
+# runtime validation fails.
 permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Template validation
+  validate-static:
+    name: Template validation (static)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       # Calling template repo (Dockerfile + config.yaml + adapter.py).
       - uses: actions/checkout@v4
@@ -39,18 +61,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # Cache pip against the calling repo's own requirements.txt
-          # (the file we install one step below). Pointing the cache key
-          # at the validator's own deps was decorative — pyyaml never
-          # changes, so the key never invalidated even when the template
-          # added a heavy dep like crewai.
-          cache: "pip"
-          cache-dependency-path: requirements.txt
-      # Secret-scan runs FIRST, before any `pip install` could execute a
-      # post-install hook from a malicious dep added by a template PR.
-      # Same threat surface the Docker build smoke test already runs
-      # against (Dockerfile RUN steps execute before the secret-scan if
-      # the docker step were earlier), but cheap to keep ordered safely.
+      # Secret scan — the most important check. Always runs.
       - name: Check for secrets
         run: |
           python3 - << 'PYEOF'
@@ -100,6 +111,42 @@ jobs:
           else:
               print("::notice::No secrets detected")
           PYEOF
+      # Static-only validator — file existence checks, YAML parse,
+      # AST inspection of adapter.py (no import). Doesn't execute
+      # any third-party code; safe on fork PRs.
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+
+  validate-runtime:
+    name: Template validation (runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate-static
+    # Skip when the PR comes from a fork — those are external,
+    # untrusted, and would let attackers run pip install / docker
+    # build / adapter.py import on our runner. Internal PRs (head
+    # repo == base repo, fork == false) and push events to internal
+    # branches both keep full coverage.
+    #
+    # github.event.pull_request.head.repo.fork is null for non-PR
+    # events (push, schedule, etc.) — defaults to running.
+    if: github.event.pull_request.head.repo.fork != true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Molecule-AI/molecule-ci
+          path: .molecule-ci-canonical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache pip against the calling repo's own requirements.txt
+          # (the file we install one step below). Pointing the cache key
+          # at the validator's own deps was decorative — pyyaml never
+          # changes, so the key never invalidated even when the template
+          # added a heavy dep like crewai.
+          cache: "pip"
+          cache-dependency-path: requirements.txt
       - run: pip install pyyaml -q
       # Install the template's runtime dependencies so the validator's
       # `check_adapter_runtime_load()` can import adapter.py the same way
@@ -112,6 +159,7 @@ jobs:
         run: pip install -q -r requirements.txt
       - if: hashFiles('requirements.txt') == ''
         run: pip install -q molecule-ai-workspace-runtime
+      # Full validator — includes adapter.py import (exec_module).
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
