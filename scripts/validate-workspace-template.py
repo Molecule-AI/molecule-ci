@@ -410,11 +410,21 @@ def check_adapter_runtime_load() -> None:
 
 
 def main() -> None:
+    # --static-only skips check_adapter_runtime_load(), which calls
+    # importlib's exec_module() on the template's adapter.py. That's
+    # untrusted code execution — fine on internal PRs and post-merge,
+    # unsafe on external fork PRs (#135). Static checks (file presence,
+    # YAML parse, regex/AST inspection) stay enabled in static mode.
+    static_only = "--static-only" in sys.argv
+
     check_dockerfile()
     check_config_yaml()
     check_requirements()
     check_adapter()
-    check_adapter_runtime_load()
+    if not static_only:
+        check_adapter_runtime_load()
+    else:
+        print("::notice::skipping adapter.py import check (--static-only mode)")
 
     for w in WARNINGS:
         print(f"::warning::{w}")
@@ -422,7 +432,8 @@ def main() -> None:
         print(f"::error::{e}")
     if ERRORS:
         sys.exit(1)
-    print(f"✓ Template validation passed ({len(WARNINGS)} warning(s))")
+    suffix = " [static-only]" if static_only else ""
+    print(f"✓ Template validation passed ({len(WARNINGS)} warning(s)){suffix}")
 
 
 if __name__ == "__main__":
