@@ -28,7 +28,7 @@ name: Auto-promote staging → main (PR-based, reusable)
 #     pull-requests: write
 #   jobs:
 #     promote:
-#       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-staging-pr.yml@main
+#       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-staging-pr.yml@v1
 #       with:
 #         gates: "ci.yml,e2e-staging-canvas.yml,e2e-api.yml,codeql.yml"
 #         force: ${{ github.event.inputs.force == 'true' }}
