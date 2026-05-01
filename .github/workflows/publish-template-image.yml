@@ -308,10 +308,21 @@ jobs:
           # time but the smoke times out before any real call goes out.
           # Set the common ones so any adapter that early-validates a
           # specific key sees a non-empty value.
+          # PYTHONPATH=/app mirrors what the platform's provisioner
+          # injects at workspace startup (workspace-server/internal/
+          # provisioner/provisioner.go:563). Without it,
+          # `importlib.import_module('adapter')` in the runtime's
+          # preflight check fails with ModuleNotFoundError because
+          # molecule-runtime is a console_scripts entry point —
+          # sys.path[0] is /usr/local/bin, NOT /app. The existing
+          # static import smoke step above doesn't hit this because
+          # `python3 -c "import $mod"` adds cwd to sys.path; only the
+          # entry-point invocation needs PYTHONPATH.
           set +e
           timeout 60 docker run --rm \
             -v "${SMOKE_CONFIG_DIR}:/configs" \
             -e WORKSPACE_ID=fake-smoke \
+            -e PYTHONPATH=/app \
             -e MOLECULE_SMOKE_MODE=1 \
             -e MOLECULE_SMOKE_TIMEOUT_SECS=10 \
             -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
