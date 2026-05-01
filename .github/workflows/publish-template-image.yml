@@ -239,6 +239,89 @@ jobs:
           '
           echo "::notice::✓ ${IMAGE} all /app/*.py modules import cleanly against installed runtime"
 
+      - name: Boot smoke — execute() against stub deps (#2275)
+        # The static import smoke above only IMPORTs /app/*.py — lazy
+        # imports buried inside `async def execute(...)` bodies (e.g.
+        # `from a2a.types import FilePart`) NEVER evaluate at static-
+        # import time. The 2026-04-2x v0→v1 a2a-sdk migration shipped 5
+        # such regressions in templates that all looked fine at module-
+        # load smoke (claude-code, langgraph, deepagents, gemini-cli,
+        # hermes — every one a separate provisioning incident).
+        #
+        # This step boots the image with MOLECULE_SMOKE_MODE=1, which
+        # routes molecule-runtime through smoke_mode.run_executor_smoke()
+        # — invokes executor.execute(stub_ctx, stub_queue) once with a
+        # short timeout. Healthy import tree → execution proceeds far
+        # enough to hit a network boundary and times out (exit 0).
+        # Broken lazy import → ImportError/ModuleNotFoundError from
+        # inside the executor body (exit 1).
+        #
+        # Requires runtime >= 0.1.60 (the version that introduced
+        # smoke_mode). Older runtimes silently no-op and would hang on
+        # uvicorn, so we detect the module first and skip if absent —
+        # this lets templates pinned to older runtimes continue to
+        # publish without this gate flipping red, while every fresh
+        # cascade-triggered build (which forwards the just-published
+        # version as RUNTIME_VERSION) gets the gate automatically.
+        #
+        # Wrapped in `timeout` as a belt-and-suspenders safety net in
+        # case smoke_mode itself wedges — runner shouldn't hang
+        # indefinitely on a single template.
+        shell: bash
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
+        run: |
+          set -eu
+
+          HAS_SMOKE_MODE=$(docker run --rm --entrypoint sh "${IMAGE}" -c \
+            'python3 -c "import molecule_runtime.smoke_mode" >/dev/null 2>&1 && echo yes || echo no')
+          if [ "${HAS_SMOKE_MODE}" = "no" ]; then
+            echo "::warning::installed runtime predates molecule-core#2275 (no molecule_runtime.smoke_mode); skipping boot smoke. Bump requirements.txt to molecule-ai-workspace-runtime>=0.1.60 to enable."
+            exit 0
+          fi
+
+          if [ ! -f config.yaml ]; then
+            echo "::error::config.yaml not found at repo root — boot smoke needs it to populate /configs. Templates without a config.yaml at root cannot be boot-smoked; either add one or skip this gate by setting an old runtime pin."
+            exit 1
+          fi
+
+          # Mount the repo's own config.yaml at /configs so the runtime
+          # can reach create_executor() — that's where the lazy imports
+          # we want to test actually live. World-readable so the
+          # entrypoint's drop-priv to uid 1000 can read it.
+          SMOKE_CONFIG_DIR=$(mktemp -d)
+          cp config.yaml "${SMOKE_CONFIG_DIR}/"
+          chmod -R go+r "${SMOKE_CONFIG_DIR}"
+
+          # Stub credentials — adapters validate shape at create_executor
+          # time but the smoke times out before any real call goes out.
+          # Set the common ones so any adapter that early-validates a
+          # specific key sees a non-empty value.
+          set +e
+          timeout 60 docker run --rm \
+            -v "${SMOKE_CONFIG_DIR}:/configs:ro" \
+            -e WORKSPACE_ID=fake-smoke \
+            -e MOLECULE_SMOKE_MODE=1 \
+            -e MOLECULE_SMOKE_TIMEOUT_SECS=10 \
+            -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
+            -e ANTHROPIC_API_KEY=sk-fake-smoke-key \
+            -e GEMINI_API_KEY=fake-smoke-key \
+            -e OPENAI_API_KEY=sk-fake-smoke-key \
+            "${IMAGE}"
+          rc=$?
+          set -e
+          rm -rf "${SMOKE_CONFIG_DIR}"
+
+          if [ "${rc}" -eq 124 ]; then
+            echo "::error::boot smoke wedged past 60s — smoke_mode itself failed to terminate (look for blocking calls before MOLECULE_SMOKE_TIMEOUT_SECS fires)"
+            exit 1
+          fi
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::boot smoke failed (exit ${rc}) — executor.execute() raised an import error against the installed runtime. Check the container log above for the offending lazy import."
+            exit "${rc}"
+          fi
+          echo "::notice::✓ ${IMAGE} executor.execute() smoke passed (lazy imports healthy)"
+
       - name: Push image to GHCR (post-smoke)
         # Now that the smoke test passed, push both tags. build-push-action
         # reuses the cached build from the load step above, so this is fast
