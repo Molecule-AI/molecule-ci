@@ -332,7 +332,15 @@ jobs:
             "${IMAGE}"
           rc=$?
           set -e
-          rm -rf "${SMOKE_CONFIG_DIR}"
+          # Cleanup is best-effort: the entrypoint chowns /configs to
+          # uid 1000 (agent) inside the container, which propagates to
+          # the host bind-mount, leaving the runner user unable to
+          # remove the files. Fall back to `sudo rm` and ignore any
+          # remaining failure — the runner is ephemeral, /tmp is
+          # cleaned automatically post-job.
+          rm -rf "${SMOKE_CONFIG_DIR}" 2>/dev/null \
+            || sudo rm -rf "${SMOKE_CONFIG_DIR}" 2>/dev/null \
+            || true
 
           if [ "${rc}" -eq 124 ]; then
             echo "::error::boot smoke wedged past 60s — smoke_mode itself failed to terminate (look for blocking calls before MOLECULE_SMOKE_TIMEOUT_SECS fires)"
