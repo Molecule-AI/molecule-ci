@@ -37,6 +37,26 @@ jobs:
     uses: Molecule-AI/molecule-ci/.github/workflows/validate-org-template.yml@v1
 ```
 
+### Workspace template repos publishing to GHCR
+
+```yaml
+# .github/workflows/publish-image.yml
+name: publish-image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@v1
+    secrets: inherit
+```
+
+Also fires from the runtime-publish cascade (`repository_dispatch`) so a fresh `molecule-ai-workspace-runtime` PyPI release auto-rebuilds every template image.
+
 ### Any repo with auto-merge enabled
 
 PR-time guards (currently: disable auto-merge on follow-up push). Consume from a thin caller:
@@ -107,6 +127,48 @@ PR-time safety guard. When `pull_request:synchronize` fires (= a new commit push
 Together they cover the full lifecycle of "auto-merge enabled → new commits arrive" without operator discipline.
 
 **False-positive note:** if a CI bot pushes (dependency update, secret rotation), this also disables auto-merge. That's intentional — the operator who originally enabled auto-merge gets notified and re-engages, which is exactly the verify-after-machine-edits behavior we want.
+
+## publish-template-image
+
+Builds + publishes Docker template images for workspace runtimes to GHCR (`ghcr.io/molecule-ai/workspace-template-<runtime>:latest` plus a per-commit `:sha-<7>` tag). Auto-derives `<runtime>` from the caller repo name (`molecule-ai-workspace-template-<runtime>`).
+
+**Triggers** (caller-side `on:` block):
+
+| Event | When | Source |
+|---|---|---|
+| `push` to `main` | Template Dockerfile / config / adapter changes | Caller commit |
+| `workflow_dispatch` | Manual rebuild | Operator |
+| `repository_dispatch` (cascade) | New `molecule-ai-workspace-runtime` PyPI release | molecule-core `publish-runtime.yml` fans out to every template repo |
+
+**Inputs** (all optional):
+
+| Input | Default | Purpose |
+|---|---|---|
+| `runtime_name` | derived from repo name | Override only when image should diverge from `molecule-ai-workspace-template-<runtime>` convention |
+| `runtime_version` | empty (Dockerfile pin wins) | Forwarded as `RUNTIME_VERSION` build-arg → unique cache key per version. Cascade builds set this to the just-published wheel version so each rebuild gets a fresh `pip install`. |
+
+**Secrets:** `secrets: inherit` (uses caller's `GITHUB_TOKEN` for GHCR push — no custom secrets needed).
+
+**Outputs:** `image` (full ref pushed) and `sha` (short tag).
+
+**Pipeline order** (each step is a publish gate — fail = no GHCR push):
+
+1. **Lint** — bare imports of runtime modules (e.g. `from plugins import ...` instead of `from molecule_runtime.plugins import ...`). Module list pulled live from the latest wheel's `_runtime_modules.json` so the lint never drifts from the rewriter. Catches the 2026-04-27 5-template ImportError outage class.
+2. **Static import smoke** — boots the image and `import`s every `/app/*.py`, exercising adapter-level module-load failures and runtime version skew.
+3. **Boot smoke** (`MOLECULE_SMOKE_MODE=1`) — actually runs `executor.execute()` against stub deps + stub creds, catching **lazy imports** buried inside `async def execute(...)` bodies that the static smoke can't see (the a2a-sdk v0→v1 migration shipped 5 such regressions). Also consults `runtime_wedge.is_wedged()` to upgrade provisional PASS to FAIL when an adapter marked the runtime wedged.
+4. **Push to GHCR** — only after all three gates pass.
+
+**Smoke timeout calibration** (load-bearing — do not lower without re-testing with an injected wedge):
+
+- `MOLECULE_SMOKE_TIMEOUT_SECS=90` — inner timeout. Outlasts claude-agent-sdk's 60s `initialize()` handshake so the adapter's wedge-catch arm runs **before** smoke gives up. Lowering this back to the original 10s blinds the gate to PR-25-class init-wedge bugs.
+- `timeout 120` outer wrapper — runner-level safety net; surfaces `exit 124` (smoke_mode itself wedged) as a distinct error from `exit 1` (adapter ImportError / wedge).
+- 90s/120s pair landed in [PR #33](https://github.com/Molecule-AI/molecule-ci/pull/33) (2026-05-02) for SDK-init-wedge coverage. The workflow's inline comment is the source of truth — read it before changing.
+
+**Cross-references:**
+
+- Boot-smoke contract + wedge protocol: `molecule-core/workspace/smoke_mode.py` docstring
+- Cascade trigger (runtime publish → template rebuild fan-out): `molecule-core/.github/workflows/publish-runtime.yml`
+- Why this gate exists at all (original outage post-mortem): the 2026-04-27 `RuntimeCapabilities` ImportError that shipped to `:latest` because the old smoke only inspected the entrypoint string
 
 ## License
 
