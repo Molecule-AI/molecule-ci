@@ -239,7 +239,7 @@ jobs:
           '
           echo "::notice::✓ ${IMAGE} all /app/*.py modules import cleanly against installed runtime"
 
-      - name: Boot smoke — execute() against stub deps (#2275)
+      - name: Boot smoke — execute() against stub deps (#2275, task #131)
         # The static import smoke above only IMPORTs /app/*.py — lazy
         # imports buried inside `async def execute(...)` bodies (e.g.
         # `from a2a.types import FilePart`) NEVER evaluate at static-
@@ -255,6 +255,19 @@ jobs:
         # enough to hit a network boundary and times out (exit 0).
         # Broken lazy import → ImportError/ModuleNotFoundError from
         # inside the executor body (exit 1).
+        #
+        # Universal turn-smoke (task #131): run_executor_smoke also
+        # consults runtime_wedge.is_wedged() at the end of every result
+        # path and upgrades a provisional PASS to FAIL when an adapter
+        # marked the runtime wedged. Catches PR-25-class regressions
+        # (claude-agent-sdk init wedge from a malformed CLI argv) where
+        # the SDK takes 60s to time out on `initialize()` — the outer
+        # wait_for must outlast that handshake so the adapter's wedge
+        # catch arm runs before the smoke gives up. That's why the
+        # smoke timeout is 90s (NOT the original 10s) and the outer
+        # `timeout` wrapper is 120s (NOT 60s). Lowering either back
+        # makes this gate blind to init-wedge bugs again — confirm with
+        # an injected wedge in test_smoke_mode.py before changing.
         #
         # Requires runtime >= 0.1.60 (the version that introduced
         # smoke_mode). Older runtimes silently no-op and would hang on
@@ -319,12 +332,20 @@ jobs:
           # `python3 -c "import $mod"` adds cwd to sys.path; only the
           # entry-point invocation needs PYTHONPATH.
           set +e
-          timeout 60 docker run --rm \
+          # MOLECULE_SMOKE_TIMEOUT_SECS=90 is calibrated to outlast
+          # claude-agent-sdk's 60s initialize() handshake (see step
+          # comment above + workspace/smoke_mode.py top docstring) so
+          # adapter wedge catch arms run before run_executor_smoke
+          # gives up. Outer `timeout 120` is the runner-level safety
+          # net — slightly longer than the inner timeout so a hung
+          # smoke_mode itself surfaces as exit 124 and gets a clear
+          # error message instead of just `exit 1`.
+          timeout 120 docker run --rm \
             -v "${SMOKE_CONFIG_DIR}:/configs" \
             -e WORKSPACE_ID=fake-smoke \
             -e PYTHONPATH=/app \
             -e MOLECULE_SMOKE_MODE=1 \
-            -e MOLECULE_SMOKE_TIMEOUT_SECS=10 \
+            -e MOLECULE_SMOKE_TIMEOUT_SECS=90 \
             -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
             -e ANTHROPIC_API_KEY=sk-fake-smoke-key \
             -e GEMINI_API_KEY=fake-smoke-key \
@@ -343,14 +364,14 @@ jobs:
             || true
 
           if [ "${rc}" -eq 124 ]; then
-            echo "::error::boot smoke wedged past 60s — smoke_mode itself failed to terminate (look for blocking calls before MOLECULE_SMOKE_TIMEOUT_SECS fires)"
+            echo "::error::boot smoke wedged past 120s — smoke_mode itself failed to terminate (look for blocking calls before MOLECULE_SMOKE_TIMEOUT_SECS fires)"
             exit 1
           fi
           if [ "${rc}" -ne 0 ]; then
-            echo "::error::boot smoke failed (exit ${rc}) — executor.execute() raised an import error against the installed runtime. Check the container log above for the offending lazy import."
+            echo "::error::boot smoke failed (exit ${rc}) — executor.execute() raised an import error OR an adapter marked runtime_wedge.is_wedged() (PR-25-class init wedge). Check the container log above for the offending lazy import or wedge reason."
             exit "${rc}"
           fi
-          echo "::notice::✓ ${IMAGE} executor.execute() smoke passed (lazy imports healthy)"
+          echo "::notice::✓ ${IMAGE} executor.execute() smoke passed (imports healthy, no runtime wedge)"
 
       - name: Push image to GHCR (post-smoke)
         # Now that the smoke test passed, push both tags. build-push-action
