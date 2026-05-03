@@ -373,11 +373,55 @@ jobs:
           fi
           echo "::notice::✓ ${IMAGE} executor.execute() smoke passed (imports healthy, no runtime wedge)"
 
-      - name: Push image to GHCR (post-smoke)
-        # Now that the smoke test passed, push both tags. build-push-action
-        # reuses the cached build from the load step above, so this is fast
-        # — it's effectively a layer push, not a rebuild. Same build-args
-        # passed for cache key consistency.
+      - name: Trivy vulnerability scan (HIGH/CRITICAL gate)
+        # Belt-and-suspenders security gate: scan the locally-loaded image
+        # for known CVEs before promoting to :latest. Fails the workflow
+        # on any HIGH or CRITICAL finding so a vulnerable base layer
+        # never poisons :latest.
+        #
+        # Why pre-push: same reason boot smoke is pre-push — anything
+        # caught here means the bad bits never reach GHCR + never get
+        # pulled by a workspace. Catching post-push would leave a
+        # window where every fresh provision pulls a known-vulnerable
+        # image.
+        #
+        # Why HIGH+CRITICAL only: medium/low findings are too noisy in
+        # practice (~hundreds per Ubuntu base image, mostly unfixed
+        # apt CVEs that need an upstream Canonical respin). Promoting
+        # those to gate would drown signal in noise. RFC #388
+        # pre-implementation gate spec.
+        #
+        # ignore-unfixed=true follows the Trivy-recommended pattern for
+        # base-image scanning where unfixed CVEs in apt deps are
+        # operationally non-actionable until the next Canonical respin.
+        # Once Dockerfiles digest-pin the base (RFC #388 PR-2 second
+        # half), this becomes the matched pair: pin avoids surprise
+        # base-bumps; Trivy catches if the pinned digest itself
+        # accumulates fixable vulns.
+        #
+        # exit-code=1 + severity=HIGH,CRITICAL → workflow fails.
+        # No push happens because this step's failure short-circuits
+        # the next step.
+        uses: aquasecurity/trivy-action@0.28.0
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
+        with:
+          image-ref: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          # vuln-type: keep default (os,library) — both apt-installed
+          # OS packages AND pip-installed Python deps get scanned.
+          # Catches both classes (e.g. a base CVE from an outdated
+          # libssl AND a pinned old version of `requests` with a
+          # known issue).
+
+      - name: Push image to GHCR (post-smoke + post-scan)
+        # Now that the smoke test AND the Trivy scan passed, push both
+        # tags. build-push-action reuses the cached build from the load
+        # step above, so this is fast — it's effectively a layer push,
+        # not a rebuild. Same build-args passed for cache key consistency.
         uses: docker/build-push-action@v6
         with:
           context: .
