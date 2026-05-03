@@ -402,7 +402,7 @@ jobs:
         # exit-code=1 + severity=HIGH,CRITICAL → workflow fails.
         # No push happens because this step's failure short-circuits
         # the next step.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.36.0
         env:
           IMAGE: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
         with:
